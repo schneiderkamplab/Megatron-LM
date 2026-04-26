@@ -1,0 +1,25 @@
+name: smoke_test
+
+train:
+  train_iters: 5
+  global_batch_size: 2
+  micro_batch_size: 1
+
+models:
+  - name: gpt2-small
+    hf_id: openai-community/gpt2
+    tp: 1
+    pp: 1
+    seq_length: 512
+
+replicators:
+  - strategy: none
+  - strategy: full
+  - strategy: demo
+    topk: 32
+    chunk: 64
+    decay: 0.999
+
+hardware:
+  - nodes: 1
+    gpus_per_node: 2

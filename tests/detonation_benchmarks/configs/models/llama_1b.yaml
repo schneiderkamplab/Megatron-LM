@@ -1,0 +1,5 @@
+name: llama-1b
+hf_id: meta-llama/Llama-3.2-1B
+tp: 1
+pp: 1
+seq_length: 2048

@@ -101,6 +101,12 @@ def fully_shard_model(
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
     disable_symmetric_registration: bool = False,
     enable_fine_grained_param_gather: bool = False,
+    replication_strategy: str = 'none',
+    replication_decay: float = 0.999,
+    replication_topk: int = 32,
+    replication_chunk: int = 64,
+    replication_rate: float = 0.1,
+    replication_seed: int = 42,
 ) -> torch.nn.Module:
     """
     Fully-shard the model for Megatron-FSDP. This wraps the model in a MegatronFSDP
@@ -341,6 +347,12 @@ def fully_shard_model(
         fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
+        replication_strategy=replication_strategy,
+        replication_decay=replication_decay,
+        replication_topk=replication_topk,
+        replication_chunk=replication_chunk,
+        replication_rate=replication_rate,
+        replication_seed=replication_seed,
     )
 
     # Create FSDPDistributedIndex.
@@ -486,6 +498,11 @@ def fully_shard_optimizer(
         # the post-backward hook and we need to synchronize manually.
         if sync_grad_before_optimizer_step and not mfsdp_model.model_auto_sync:
             mfsdp_model.finish_grad_sync()
+
+        # DeToNation: update the learning rate provider before optimizer step.
+        if mfsdp_model.replicator is not None:
+            current_lr = optimizer.param_groups[0].get("lr", 0.0)
+            mfsdp_model._current_lr[0] = current_lr
 
         # Execute the base optimizer.step() on the model optimizer named parameters.
         optimizer_step_base_func(optimizer, *args, **kwargs)

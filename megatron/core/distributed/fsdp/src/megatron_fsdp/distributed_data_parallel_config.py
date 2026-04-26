@@ -145,6 +145,30 @@ class DistributedDataParallelConfig:
       No additional memory is allocated when `grad_comm_dtype == main_grads_dtype`.
     """
 
+    replication_strategy: str = 'none'
+    """Inter-node gradient replication strategy (DeToNation). Replaces the standard
+      DP-Outer all_reduce/reduce_scatter with a custom communication strategy that
+      can reduce bandwidth usage. Valid values: 'none', 'full', 'demo', 'slicing',
+      'striding', 'random'. Only effective with HSDP or standalone replication mode.
+      Defaults to 'none' (standard Megatron-LM communication).
+    """
+
+    replication_decay: float = 0.999
+    """Decay factor for the delta buffer in compression-based replicators."""
+
+    replication_topk: int = 32
+    """Top-k selection size for DeMo replication."""
+
+    replication_chunk: int = 64
+    """Chunk size for DeMo, slicing, and striding replicators."""
+
+    replication_rate: float = 0.1
+    """Compression rate (fraction of data transmitted) for slicing, striding,
+      and random replicators."""
+
+    replication_seed: int = 42
+    """Random seed for the random replicator."""
+
     def __post_init__(self):
         import os
 

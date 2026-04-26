@@ -1,0 +1,5 @@
+name: gpt2-small
+hf_id: openai-community/gpt2
+tp: 1
+pp: 1
+seq_length: 1024

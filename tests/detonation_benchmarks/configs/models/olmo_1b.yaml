@@ -1,0 +1,5 @@
+name: olmo-1b
+hf_id: allenai/OLMo-2-0425-1B
+tp: 1
+pp: 1
+seq_length: 2048

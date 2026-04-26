@@ -398,9 +398,62 @@ class MegatronFSDP(torch.nn.Module):
         self.side_stream_for_buffer_copy_and_grad_accum = torch.cuda.Stream()
         self.side_stream_for_param_gather = torch.cuda.Stream()
 
+        # DeToNation replicator setup.
+        self.replicator = None
+        self.standalone_replication_group = None
+        replication_strategy = getattr(self.ddp_config, 'replication_strategy', 'none')
+        if replication_strategy != 'none':
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.replicators import get_replicator
+
+            self.replicator = get_replicator(
+                strategy=replication_strategy,
+                compression_decay=getattr(self.ddp_config, 'replication_decay', 0.999),
+                compression_topk=getattr(self.ddp_config, 'replication_topk', 32),
+                compression_chunk=getattr(self.ddp_config, 'replication_chunk', 64),
+                compression_rate=getattr(self.ddp_config, 'replication_rate', 0.1),
+                seed=getattr(self.ddp_config, 'replication_seed', 42),
+            )
+
+            # Determine the replication process group.
+            if self.dist_index.use_hybrid_fsdp:
+                # HSDP mode: use the existing outer FSDP group.
+                replication_group = self.dist_index.get_outer_fsdp_group()
+            else:
+                # Standalone mode: create a new process group spanning all ranks.
+                world_size = torch.distributed.get_world_size()
+                world_group = torch.distributed.group.WORLD
+                replication_group = torch.distributed.new_group(
+                    ranks=list(range(world_size)), backend=torch.distributed.get_backend()
+                )
+                self.standalone_replication_group = replication_group
+
+            # Compute bucket sizes for replicator init.
+            bucket_sizes = {}
+            dtype = self.mp_policy.grad_comm_dtype or torch.float32
+            for bucket_id in range(self.param_and_grad_buffer.num_buckets):
+                gbuf = self.param_and_grad_buffer.parameter_groups[bucket_id].main_grad_buffer
+                if gbuf is not None:
+                    bucket_sizes[bucket_id] = gbuf.data.numel()
+
+            # Learning rate provider: will be set during optimizer wiring.
+            self._current_lr = [0.0]
+            def lr_provider():
+                return self._current_lr[0]
+
+            self.replicator.init(
+                process_group=replication_group,
+                bucket_sizes=bucket_sizes,
+                dtype=dtype,
+                device=self.device,
+                lr_provider=lr_provider,
+            )
+
         # Initialize the reduce-scatter pipeline.
         self.grad_reduce_pipeline = GradReducePipeline(
-            self.param_and_grad_buffer, rs_stream=self.side_stream_for_buffer_copy_and_grad_accum
+            self.param_and_grad_buffer,
+            rs_stream=self.side_stream_for_buffer_copy_and_grad_accum,
+            replicator=self.replicator,
+            standalone_replication_group=self.standalone_replication_group,
         )
 
         # Initialize the all-gather pipeline.
@@ -1323,6 +1376,10 @@ class MegatronFSDP(torch.nn.Module):
         NOTE: force_all_reduce is included as an argument to maintain API compatibility
         with DDP.force_grad_sync.
         """
+        # DeToNation: notify replicator of step start.
+        if self.replicator is not None:
+            self.replicator.pre_step()
+
         # Synchronize gradient reduce-scatter operations for all model gradients.
         self.synchronize_gradient_reduce()
 
@@ -1422,6 +1479,10 @@ class MegatronFSDP(torch.nn.Module):
             if param.requires_grad:
                 param.grad_added_to_main_grad = False
         self.param_and_grad_buffer.zero_grad()
+
+        # DeToNation: notify replicator that step is complete.
+        if self.replicator is not None:
+            self.replicator.post_step()
 
     def install_optimized_model_weights(self):
         """

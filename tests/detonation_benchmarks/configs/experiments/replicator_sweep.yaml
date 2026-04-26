@@ -1,0 +1,40 @@
+name: replicator_sweep
+
+train:
+  train_iters: 100
+  global_batch_size: 32
+  micro_batch_size: 1
+
+models:
+  - name: gpt2-small
+    hf_id: openai-community/gpt2
+    tp: 1
+    pp: 1
+    seq_length: 1024
+
+  - name: llama-1b
+    hf_id: meta-llama/Llama-3.2-1B
+    tp: 1
+    pp: 1
+    seq_length: 2048
+
+replicators:
+  - strategy: none
+  - strategy: full
+  - strategy: demo
+    topk: 32
+    chunk: 64
+    decay: 0.999
+  - strategy: slicing
+    rate: 0.1
+  - strategy: striding
+    rate: 0.1
+  - strategy: random
+    rate: 0.1
+    seed: 42
+
+hardware:
+  - nodes: 1
+    gpus_per_node: 4
+  - nodes: 2
+    gpus_per_node: 8
