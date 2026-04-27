@@ -57,3 +57,6 @@ torchrun \
     --replicator-idx $REPLICATOR_IDX \
     --hardware-idx $HARDWARE_IDX \
     $EXTRA_ARGS
+
+
+# NODES=1 GPUS_PER_NODE=2 ./run.sh --config configs/experiments/smoke_test.yaml
