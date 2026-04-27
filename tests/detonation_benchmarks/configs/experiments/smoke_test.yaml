@@ -1,7 +1,7 @@
 name: smoke_test
 
 train:
-  train_iters: 5
+  train_iters: 50
   global_batch_size: 2
   micro_batch_size: 1
 

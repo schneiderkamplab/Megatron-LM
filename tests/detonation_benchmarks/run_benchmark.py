@@ -69,35 +69,70 @@ def initialize_model_parallel(model_cfg):
 
 
 def build_model(model_cfg):
-    """Build a HuggingFace model using native Megatron APIs."""
-    # Import directly from the module file since it's not exported from __init__.py
-    from megatron.core.models.huggingface.module import AutoHuggingFaceModel
-    from megatron.core.transformer.transformer_config import TransformerConfig
-    from megatron.core.transformer.enums import ModelType
+    """Build a model using Megatron-Bridge for HF+TP/PP support.
 
-    # Create a minimal config
-    config = TransformerConfig(
-        num_layers=1,  # Minimal for benchmarking
-        hidden_size=256,
-        num_attention_heads=4,
-        use_cpu_initialization=True,
-        pipeline_dtype=torch.float32,
-        tensor_model_parallel_size=model_cfg.tp,
-        pipeline_model_parallel_size=model_cfg.pp,
-    )
+    Uses megatron.bridge.AutoBridge to convert HuggingFace models to Megatron
+    with proper tensor and pipeline parallelism support.
 
-    # Add huggingface model path to config
-    # AutoHuggingFaceModel expects this attribute
-    config.huggingface_model_name_or_path = model_cfg.hf_id
+    Falls back to AutoHuggingFaceModel for TP=1, PP=1 if Bridge is not available.
+    """
+    try:
+        from megatron.bridge import AutoBridge
 
-    # Build the model - AutoHuggingFaceModel works with ANY HF model
-    model = AutoHuggingFaceModel(config)
+        # Load HuggingFace model via Bridge
+        bridge = AutoBridge.from_hf_pretrained(model_cfg.hf_id, trust_remote_code=True)
+        provider = bridge.to_megatron_provider(load_weights=False)
 
-    # Add model_type attribute required by Megatron's training infrastructure
-    # This is expected by get_model_type() in pipeline_parallel/schedules.py
-    model.model_type = ModelType.encoder_or_decoder
+        # Configure parallelism settings
+        provider.tensor_model_parallel_size = model_cfg.tp
+        provider.pipeline_model_parallel_size = model_cfg.pp
+        provider.sequence_parallel = False  # Can be enabled via config if needed
+        provider.variable_seq_lengths = True
 
-    return model, config
+        # Finalize the provider
+        provider.finalize()
+
+        # Build the model using the provider
+        model = provider.provide(pre_process=True, post_process=True)
+        config = model.config
+
+        print(f"✅ Using Megatron-Bridge with HF model ({model_cfg.hf_id})")
+        print(f"   TP={model_cfg.tp}, PP={model_cfg.pp}, HS={config.hidden_size}, L={config.num_layers}")
+
+        return model, config
+
+    except ImportError:
+        print("⚠️  megatron.bridge not available, falling back to AutoHuggingFaceModel")
+        print("   Note: This only supports TP=1, PP=1. For TP/PP support, install megatron-bridge.")
+
+        if model_cfg.tp != 1 or model_cfg.pp != 1:
+            raise RuntimeError(
+                f"TP={model_cfg.tp}, PP={model_cfg.pp} requires megatron-bridge. "
+                "Install it or set tp=1, pp=1 in your config."
+            )
+
+        # Fallback to AutoHuggingFaceModel for TP=1, PP=1
+        from megatron.core.models.huggingface.module import AutoHuggingFaceModel
+        from megatron.core.transformer.transformer_config import TransformerConfig
+        from megatron.core.transformer.enums import ModelType
+
+        config = TransformerConfig(
+            num_layers=1,  # Minimal for benchmarking
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            pipeline_dtype=torch.float32,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+        )
+        config.huggingface_model_name_or_path = model_cfg.hf_id
+
+        model = AutoHuggingFaceModel(config)
+        model.model_type = ModelType.encoder_or_decoder
+
+        print(f"✅ Using AutoHuggingFaceModel fallback ({model_cfg.hf_id})")
+
+        return model, config
 
 
 def setup_ddp(model, config, replicator_cfg):
@@ -130,13 +165,13 @@ def setup_ddp(model, config, replicator_cfg):
 
 
 def create_forward_step_func(model_cfg):
-    """Create forward step function for training."""
+    """Create forward step function for training with native Megatron and HF models."""
 
     def forward_step_func(data_iterator, model):
         """Forward step function that computes model output and returns loss function."""
 
         def loss_func(output_tensor):
-            """Simple loss function - output_tensor is now a tensor, not HF model output."""
+            """Simple loss function - output_tensor is now a tensor."""
             # Compute mock loss from the tensor output
             loss = output_tensor.float().mean()
 
@@ -156,38 +191,37 @@ def create_forward_step_func(model_cfg):
 
         tokens = batch["tokens"].cuda()
         attention_mask = batch["attention_mask"].cuda()
+        position_ids = batch["position_ids"].cuda()
 
-        # Forward pass - handle both causal LM and encoder models
-        try:
-            # Try causal LM style (GPT-2, Llama, etc.) with labels for loss
+        # Check if this is a native Megatron model (Bridge-converted) or AutoHuggingFaceModel fallback
+        # Bridge-converted models have specific attributes like decoder or embedding
+        is_native_megatron = hasattr(model, 'decoder') or hasattr(model, 'embedding')
+
+        if is_native_megatron:
+            # Native Megatron GPT model forward pass (Bridge-converted models)
+            output_tensor = model(
+                tokens,
+                position_ids,
+                attention_mask,
+                labels=tokens,
+            )
+        else:
+            # AutoHuggingFaceModel fallback - use HF-style forward
             model_output = model(
                 input_ids=tokens,
                 attention_mask=attention_mask,
                 labels=tokens,
             )
-        except Exception as e:
-            try:
-                # Fallback: encoder style (BERT, etc.) or models that don't accept labels
-                model_output = model(
-                    input_ids=tokens,
-                    attention_mask=attention_mask,
-                )
-            except Exception as e2:
-                # Last resort: pass as positional args (for AutoHuggingFaceModel)
-                model_output = model(tokens, attention_mask=attention_mask)
 
-        # Extract the right tensor for Megatron's training loop
-        # Megatron expects a tensor, not a BaseModelOutput object
-        if hasattr(model_output, 'logits'):
-            output_tensor = model_output.logits
-        elif hasattr(model_output, 'last_hidden_state'):
-            output_tensor = model_output.last_hidden_state
-        elif isinstance(model_output, dict):
-            # Handle dictionary outputs
-            output_tensor = model_output.get('logits', model_output.get('last_hidden_state', list(model_output.values())[0]))
-        else:
-            # Assume it's already a tensor
-            output_tensor = model_output
+            # Extract the right tensor for Megatron's training loop
+            if hasattr(model_output, 'logits'):
+                output_tensor = model_output.logits
+            elif hasattr(model_output, 'last_hidden_state'):
+                output_tensor = model_output.last_hidden_state
+            elif isinstance(model_output, dict):
+                output_tensor = model_output.get('logits', model_output.get('last_hidden_state', list(model_output.values())[0]))
+            else:
+                output_tensor = model_output
 
         return output_tensor, loss_func
 
@@ -313,3 +347,16 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+"""
+cd /opt  # or your preferred directory
+git clone --recursive https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
+cd Megatron-Bridge
+
+# Make sure submodules are initialized
+git submodule update --init --recursive
+
+# Install the package
+pip install -e .
+"""
