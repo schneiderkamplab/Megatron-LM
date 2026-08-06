@@ -154,9 +154,10 @@ class DeMoBucketReplicator(BucketReplicator):
                 # DCT encode the delta
                 encoded = self._transform.encode(bucket_id, delta)
 
-                # Top-k compress
+                # Top-k compress (per-chunk)
                 sparse_idx, sparse_val = DCTBufferCompress.compress(
-                    encoded, self.compression_topk
+                    encoded, self.compression_topk,
+                    chunk_size=self._transform.chunk_sizes[bucket_id],
                 )
                 sparse_idx = sparse_idx.to(torch.int32)
 

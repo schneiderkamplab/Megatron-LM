@@ -22,33 +22,53 @@ class DCTBufferCompress:
     def compress(
         x: torch.Tensor,
         topk: int,
+        chunk_size: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compress a 1-D DCT-encoded buffer via top-k selection.
+        """Compress a 1-D DCT-encoded buffer via per-chunk top-k selection.
 
         Args:
             x: 1-D tensor of DCT coefficients, length must be divisible by
                the chunk size used during encoding.
             topk: Number of top coefficients to retain per chunk.
+            chunk_size: Size of each chunk. If 0 or not provided, falls
+               back to global top-k across the entire buffer.
 
         Returns:
-            Tuple of (indices, values) where indices are int64 and values
+            Tuple of (indices, values) where indices are int32 and values
             are the selected coefficients. Both are 1-D tensors with length
-            topk * num_chunks.
+            topk * num_chunks (or topk if global).
         """
         numel = x.numel()
         if numel == 0:
             return (
-                torch.zeros(0, dtype=torch.int64, device=x.device),
+                torch.zeros(0, dtype=torch.int32, device=x.device),
                 torch.zeros(0, dtype=x.dtype, device=x.device),
             )
 
-        topk = min(topk, numel)
+        # Global top-k fallback (legacy behavior).
+        if chunk_size is None or chunk_size <= 0:
+            topk = min(topk, numel)
+            idx = torch.topk(x.abs(), k=topk, sorted=False).indices
+            val = x[idx]
+            return idx.to(torch.int32), val
 
-        # Top-k across the entire flattened buffer
-        idx = torch.topk(x.abs(), k=topk, sorted=False).indices
-        val = x[idx]
+        # Per-chunk top-k.
+        if numel % chunk_size != 0:
+            raise ValueError(
+                f"Buffer length {numel} not divisible by chunk size {chunk_size}"
+            )
+        num_chunks = numel // chunk_size
+        topk = min(topk, chunk_size)
 
-        return idx.to(torch.int32), val
+        x_2d = x.view(num_chunks, chunk_size)
+        idx_local = torch.topk(x_2d.abs(), k=topk, dim=-1, sorted=False).indices
+        val = torch.gather(x_2d, dim=-1, index=idx_local)
+
+        # Convert local (per-chunk) indices to global indices.
+        offsets = torch.arange(num_chunks, device=x.device).unsqueeze(1) * chunk_size
+        idx_global = (idx_local + offsets).view(-1)
+
+        return idx_global.to(torch.int32), val.view(-1)
 
     @staticmethod
     @torch.no_grad()
