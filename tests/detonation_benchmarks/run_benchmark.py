@@ -1,331 +1,257 @@
 """Run a single benchmark: one model x one replicator strategy.
 
 Usage:
-    torchrun --nproc-per-node=4 run_benchmark.py \
+    torchrun --nproc-per-node=2 run_benchmark.py \
         --config configs/experiments/smoke_test.yaml \
         --model-idx 0 \
         --replicator-idx 1
 
-The script uses native Megatron-LM APIs to load models from HuggingFace and
-Megatron-LM's DistributedDataParallelConfig for replicator settings.
+Uses the native Megatron-FSDP ``fully_shard_model`` / ``fully_shard_optimizer``
+APIs so the DeToNation replicator is exercised through the real gradient
+reduction pipeline (``GradReducePipeline`` -> ``outer_fsdp_group_grad_reduce``).
+
+Supports two model modes:
+  - hf_id == "fake": in-process FakeModel (~4.2M params, no download)
+  - hf_id == "<HF model id>": loaded via transformers directly (no AutoBridge)
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import sys
 import time
-from functools import partial
+import traceback
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset
 
-# Add this directory to path for config_parser import
-import sys
+# Add this directory to path for config_parser import.
 sys.path.insert(0, str(Path(__file__).parent))
+from config_parser import parse_config  # noqa: E402
 
-from config_parser import parse_config
+# ---------------------------------------------------------------------------
+# Fake model: tiny transformer-like model (no HuggingFace download).
+# ---------------------------------------------------------------------------
+
+class FakeMLP(torch.nn.Module):
+    """Small MLP mimicking a decoder-layer FFN."""
+
+    def __init__(self, hidden_size: int = 512, intermediate_size: int = 1024):
+        super().__init__()
+        self.gate_proj = torch.nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = torch.nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = torch.nn.Linear(intermediate_size, hidden_size, bias=False)
+
+    def forward(self, x):
+        gate = torch.nn.functional.silu(self.gate_proj(x))
+        up = self.up_proj(x)
+        return self.down_proj(gate * up)
 
 
-class MockDataset(Dataset):
-    """Simple mock dataset for benchmarking."""
+class FakeModel(torch.nn.Module):
+    """Embedding + 2 MLP layers + output projection (~4.2M params)."""
 
-    def __init__(self, seq_length, num_samples=1000):
-        self.seq_length = seq_length
-        self.num_samples = num_samples
+    def __init__(self, vocab_size: int = 1024, hidden_size: int = 512,
+                 intermediate_size: int = 1024):
+        super().__init__()
+        self.embed = torch.nn.Embedding(vocab_size, hidden_size)
+        self.layer0 = FakeMLP(hidden_size, intermediate_size)
+        self.layer1 = FakeMLP(hidden_size, intermediate_size)
+        self.lm_head = torch.nn.Linear(hidden_size, vocab_size, bias=False)
 
-    def __len__(self):
-        return self.num_samples
-
-    def __getitem__(self, idx):
-        return {
-            "tokens": torch.randint(0, 1000, (self.seq_length,)),
-            "attention_mask": torch.ones(self.seq_length),
-            "position_ids": torch.arange(self.seq_length),
-        }
+    def forward(self, input_ids):
+        x = self.embed(input_ids)
+        x = self.layer0(x)
+        x = self.layer1(x)
+        return self.lm_head(x)
 
 
-def initialize_model_parallel(model_cfg):
-    """Initialize Megatron model parallel groups."""
-    from megatron.core import parallel_state
+# ---------------------------------------------------------------------------
+# Model loading.
+# ---------------------------------------------------------------------------
 
-    parallel_state.destroy_model_parallel()
+def load_fake_model(device: torch.device):
+    """Build the in-process fake model."""
+    model = FakeModel(vocab_size=1024, hidden_size=512, intermediate_size=1024)
+    model = model.to(device)
+    fsdp_unit_modules = [FakeMLP]
+    vocab_size = 1024
+    return model, fsdp_unit_modules, vocab_size
 
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    local_rank = int(os.environ["LOCAL_RANK"])
+
+def load_hf_model(hf_id: str, device: torch.device):
+    """Load a HuggingFace model directly via transformers (no AutoBridge).
+
+    Auto-detects the decoder layer class for FSDP unit modules.
+    """
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    config = AutoConfig.from_pretrained(hf_id, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        hf_id,
+        trust_remote_code=True,
+        torch_dtype=torch.float32,
+    )
+    model = model.to(device)
+
+    # Auto-detect decoder layer class for fsdp_unit_modules.
+    fsdp_unit_modules = []
+    for module in model.modules():
+        cls_name = type(module).__name__
+        if "DecoderLayer" in cls_name or cls_name.endswith("Block"):
+            if type(module) not in fsdp_unit_modules:
+                fsdp_unit_modules.append(type(module))
+
+    vocab_size = config.vocab_size
+    return model, fsdp_unit_modules, vocab_size
+
+
+# ---------------------------------------------------------------------------
+# Distributed init.
+# ---------------------------------------------------------------------------
+
+def init_distributed():
+    """Initialize torch.distributed and set the CUDA device."""
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
     torch.cuda.set_device(local_rank)
-    torch.distributed.init_process_group(
-        backend="nccl", rank=rank, world_size=world_size
-    )
-
-    parallel_state.initialize_model_parallel(
-        tensor_model_parallel_size=model_cfg.tp,
-        pipeline_model_parallel_size=model_cfg.pp,
-    )
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    return rank, world_size, local_rank
 
 
-def build_model(model_cfg):
-    """Build a model using Megatron-Bridge for HF+TP/PP support.
+# ---------------------------------------------------------------------------
+# Training loop.
+# ---------------------------------------------------------------------------
 
-    Uses megatron.bridge.AutoBridge to convert HuggingFace models to Megatron
-    with proper tensor and pipeline parallelism support.
+def run_benchmark(model_cfg, replicator_cfg, train_cfg, output_dir, rank, world_size):
+    """Run a training benchmark with the given replicator strategy.
 
-    Falls back to AutoHuggingFaceModel for TP=1, PP=1 if Bridge is not available.
+    Uses ``fully_shard_model`` + ``fully_shard_optimizer`` so the replicator
+    is wired through the real ``GradReducePipeline`` standalone-replication
+    path (``outer_fsdp_group_grad_reduce=True`` even without HSDP).
     """
-    try:
-        from megatron.bridge import AutoBridge
-
-        # Load HuggingFace model via Bridge
-        bridge = AutoBridge.from_hf_pretrained(model_cfg.hf_id, trust_remote_code=True)
-        provider = bridge.to_megatron_provider(load_weights=False)
-
-        # Configure parallelism settings
-        provider.tensor_model_parallel_size = model_cfg.tp
-        provider.pipeline_model_parallel_size = model_cfg.pp
-        provider.sequence_parallel = False  # Can be enabled via config if needed
-        provider.variable_seq_lengths = True
-
-        # Finalize the provider
-        provider.finalize()
-
-        # Build the model using the provider
-        model = provider.provide(pre_process=True, post_process=True)
-        config = model.config
-
-        print(f"✅ Using Megatron-Bridge with HF model ({model_cfg.hf_id})")
-        print(f"   TP={model_cfg.tp}, PP={model_cfg.pp}, HS={config.hidden_size}, L={config.num_layers}")
-
-        return model, config
-
-    except ImportError:
-        print("⚠️  megatron.bridge not available, falling back to AutoHuggingFaceModel")
-        print("   Note: This only supports TP=1, PP=1. For TP/PP support, install megatron-bridge.")
-
-        if model_cfg.tp != 1 or model_cfg.pp != 1:
-            raise RuntimeError(
-                f"TP={model_cfg.tp}, PP={model_cfg.pp} requires megatron-bridge. "
-                "Install it or set tp=1, pp=1 in your config."
-            )
-
-        # Fallback to AutoHuggingFaceModel for TP=1, PP=1
-        from megatron.core.models.huggingface.module import AutoHuggingFaceModel
-        from megatron.core.transformer.transformer_config import TransformerConfig
-        from megatron.core.transformer.enums import ModelType
-
-        config = TransformerConfig(
-            num_layers=1,  # Minimal for benchmarking
-            hidden_size=256,
-            num_attention_heads=4,
-            use_cpu_initialization=True,
-            pipeline_dtype=torch.float32,
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-        )
-        config.huggingface_model_name_or_path = model_cfg.hf_id
-
-        model = AutoHuggingFaceModel(config)
-        model.model_type = ModelType.encoder_or_decoder
-
-        print(f"✅ Using AutoHuggingFaceModel fallback ({model_cfg.hf_id})")
-
-        return model, config
-
-
-def setup_ddp(model, config, replicator_cfg):
-    """Set up DistributedDataParallel with replication strategy."""
-    from megatron.core.distributed import DistributedDataParallel
-    from megatron.core.distributed.distributed_data_parallel_config import (
-        DistributedDataParallelConfig,
+    from megatron.core.distributed.fsdp.src.megatron_fsdp import (
+        MixedPrecisionPolicy,
+        fully_shard_model,
+        fully_shard_optimizer,
     )
 
-    ddp_config = DistributedDataParallelConfig(
-        use_megatron_fsdp=True,
+    device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', 0))}")
+
+    # Load model (fake or real HF).
+    if model_cfg.hf_id == "fake":
+        model, fsdp_unit_modules, vocab_size = load_fake_model(device)
+    else:
+        model, fsdp_unit_modules, vocab_size = load_hf_model(model_cfg.hf_id, device)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    if rank == 0:
+        model_desc = "FakeModel" if model_cfg.hf_id == "fake" else model_cfg.hf_id
+        print(f"  Model: {model_desc} (~{total_params / 1e6:.1f}M params)")
+        print(f"  FSDP unit modules: {[m.__name__ for m in fsdp_unit_modules]}")
+
+    # Fully-shard the model with the replicator strategy.
+    model = fully_shard_model(
+        model,
+        zero_dp_strategy="optim_grads_params",
+        overlap_grad_reduce=True,
+        overlap_param_gather=True,
+        sync_model_each_microbatch=True,
+        fsdp_unit_modules=fsdp_unit_modules,
         replication_strategy=replicator_cfg.strategy,
+        replication_decay=replicator_cfg.decay,
         replication_topk=replicator_cfg.topk,
         replication_chunk=replicator_cfg.chunk,
-        replication_decay=replicator_cfg.decay,
         replication_rate=replicator_cfg.rate,
         replication_seed=replicator_cfg.seed,
-        grad_reduce_in_fp32=False,
-        overlap_grad_reduce=False,
-        use_distributed_optimizer=False,
+        mixed_precision_policy=MixedPrecisionPolicy(),
+        device=device,
     )
 
-    model = DistributedDataParallel(
-        config=config,
-        ddp_config=ddp_config,
-        module=model,
-    )
-
-    return model
-
-
-def create_forward_step_func(model_cfg):
-    """Create forward step function for training with native Megatron and HF models."""
-
-    def forward_step_func(data_iterator, model):
-        """Forward step function that computes model output and returns loss function."""
-
-        def loss_func(output_tensor):
-            """Simple loss function - output_tensor is now a tensor."""
-            # Compute mock loss from the tensor output
-            loss = output_tensor.float().mean()
-
-            # Reduce loss across data parallel ranks
-            reduced_loss = loss.clone()
-            if torch.distributed.is_initialized():
-                torch.distributed.all_reduce(reduced_loss)
-                reduced_loss = reduced_loss / torch.distributed.get_world_size()
-            return reduced_loss, {"lm loss": reduced_loss}
-
-        # Get batch from data iterator
-        try:
-            batch = next(data_iterator)
-        except StopIteration:
-            # Reinitialize iterator if exhausted
-            return None
-
-        tokens = batch["tokens"].cuda()
-        attention_mask = batch["attention_mask"].cuda()
-        position_ids = batch["position_ids"].cuda()
-
-        # Check if this is a native Megatron model (Bridge-converted) or AutoHuggingFaceModel fallback
-        # Bridge-converted models have specific attributes like decoder or embedding
-        is_native_megatron = hasattr(model, 'decoder') or hasattr(model, 'embedding')
-
-        if is_native_megatron:
-            # Native Megatron GPT model forward pass (Bridge-converted models)
-            output_tensor = model(
-                tokens,
-                position_ids,
-                attention_mask,
-                labels=tokens,
-            )
-        else:
-            # AutoHuggingFaceModel fallback - use HF-style forward
-            model_output = model(
-                input_ids=tokens,
-                attention_mask=attention_mask,
-                labels=tokens,
-            )
-
-            # Extract the right tensor for Megatron's training loop
-            if hasattr(model_output, 'logits'):
-                output_tensor = model_output.logits
-            elif hasattr(model_output, 'last_hidden_state'):
-                output_tensor = model_output.last_hidden_state
-            elif isinstance(model_output, dict):
-                output_tensor = model_output.get('logits', model_output.get('last_hidden_state', list(model_output.values())[0]))
-            else:
-                output_tensor = model_output
-
-        return output_tensor, loss_func
-
-    return forward_step_func
-
-
-def run_benchmark(model_cfg, replicator_cfg, train_cfg, output_dir):
-    """Run benchmark using native Megatron training loop."""
-    from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
-    from megatron.core.distributed.finalize_model_grads import finalize_model_grads
-    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-
-    # Initialize model parallel
-    initialize_model_parallel(model_cfg)
-    model_parallel_cuda_manual_seed(123)
-
-    # Build model
-    model, config = build_model(model_cfg)
-    model = model.cuda()
-
-    # Setup DDP
-    model = setup_ddp(model, config, replicator_cfg)
-
-    # Setup optimizer
+    # Optimizer on the FSDP-managed parameters.
     optimizer = AdamW(model.parameters(), lr=1e-4)
+    optimizer = fully_shard_optimizer(optimizer)
 
-    # Setup data
-    dataset = MockDataset(seq_length=model_cfg.seq_length)
-    dataloader = DataLoader(dataset, batch_size=train_cfg.micro_batch_size, shuffle=True)
+    # Random token data.
+    seq_length = model_cfg.seq_length
+    batch_size = train_cfg.micro_batch_size
 
-    # Get forward backward function
-    forward_backward_func = get_forward_backward_func()
-    forward_step_func = create_forward_step_func(model_cfg)
-
-    # Training loop
+    # Training loop.
     start_time = time.time()
+    losses: list[float] = []
 
     for iteration in range(train_cfg.train_iters):
-        optimizer.zero_grad()
+        input_ids = torch.randint(0, vocab_size, (batch_size, seq_length), device=device)
+        labels = input_ids.clone()
 
-        data_iterator = iter(dataloader)
-
-        # Run forward/backward
-        losses_reduced = forward_backward_func(
-            forward_step_func=forward_step_func,
-            data_iterator=data_iterator,
-            model=model,
-            num_microbatches=1,
-            seq_length=model_cfg.seq_length,
-            micro_batch_size=train_cfg.micro_batch_size,
-            decoder_seq_length=model_cfg.seq_length,
-            forward_only=False,
+        logits = model(input_ids)
+        if hasattr(logits, "logits"):
+            logits = logits.logits
+        loss = torch.nn.functional.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            labels.view(-1),
         )
 
-        # Finalize gradients and update
-        finalize_model_grads([model])
+        loss.backward()
         optimizer.step()
+        optimizer.zero_grad()
 
-        if iteration % 10 == 0:
-            rank = int(os.environ.get("RANK", 0))
-            if rank == 0:
-                print(f"Iteration {iteration}: Losses: {losses_reduced}")
+        loss_val = loss.item()
+        losses.append(loss_val)
+
+        if iteration % 10 == 0 and rank == 0:
+            print(f"    iter {iteration:4d}  loss={loss_val:.4f}")
 
     elapsed = time.time() - start_time
 
-    # Write metrics
     metrics = {
-        "total_time_sec": round(elapsed, 2),
-        "train_iters": train_cfg.train_iters,
+        "model": model_cfg.name,
+        "hf_id": model_cfg.hf_id,
         "strategy": replicator_cfg.strategy,
+        "train_iters": train_cfg.train_iters,
+        "total_time_sec": round(elapsed, 2),
+        "throughput_iters_per_sec": round(train_cfg.train_iters / elapsed, 2)
+        if elapsed > 0 else 0,
+        "final_loss": round(losses[-1], 6) if losses else None,
+        "world_size": world_size,
+        "model_params_millions": round(total_params / 1e6, 2),
     }
-    metrics_path = output_dir / "metrics.json"
-    with open(metrics_path, "w") as f:
-        json.dump(metrics, f, indent=2)
 
-    rank = int(os.environ.get("RANK", 0))
     if rank == 0:
-        print(f"\nBenchmark complete. Metrics saved to {metrics_path}")
+        metrics_path = output_dir / "metrics.json"
+        with open(metrics_path, "w") as f:
+            json.dump(metrics, f, indent=2)
+        print(f"  Metrics written to {metrics_path}")
         print(json.dumps(metrics, indent=2))
 
     return metrics
 
 
+# ---------------------------------------------------------------------------
+# Main.
+# ---------------------------------------------------------------------------
+
 def main():
-    parser = argparse.ArgumentParser(description="Run a single DeToNATION benchmark")
-    parser.add_argument("--config", required=True, help="Path to experiment YAML config")
-    parser.add_argument("--model-idx", type=int, default=0, help="Index into models list")
-    parser.add_argument("--replicator-idx", type=int, default=0, help="Index into replicators list")
-    parser.add_argument("--hardware-idx", type=int, default=0, help="Index into hardware list")
-    parser.add_argument(
-        "--output-dir",
-        default=None,
-        help="Output directory for metrics and logs (default: auto-generated)",
+    parser = argparse.ArgumentParser(
+        description="Run a single DeToNATION benchmark with Megatron-FSDP"
     )
+    parser.add_argument("--config", required=True, help="Path to experiment YAML config")
+    parser.add_argument("--model-idx", type=int, default=0)
+    parser.add_argument("--replicator-idx", type=int, default=0)
+    parser.add_argument("--hardware-idx", type=int, default=0)
+    parser.add_argument("--output-dir", default=None)
     args = parser.parse_args()
 
-    # Parse experiment config
     exp_cfg = parse_config(args.config)
-
     model_cfg = exp_cfg.models[args.model_idx]
     replicator_cfg = exp_cfg.replicators[args.replicator_idx]
     hw_cfg = exp_cfg.hardware[args.hardware_idx]
 
-    # Set output directory
     if args.output_dir is None:
         output_dir = Path(
             f"results/{exp_cfg.name}/{model_cfg.name}/{replicator_cfg.strategy}"
@@ -334,29 +260,33 @@ def main():
         output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    rank = int(os.environ.get("RANK", 0))
-    if rank == 0:
-        print(f"Model: {model_cfg.name} ({model_cfg.hf_id})")
-        print(f"Replicator: {replicator_cfg.strategy}")
-        print(f"Hardware: {hw_cfg.nodes} nodes x {hw_cfg.gpus_per_node} GPUs")
-        print(f"Output: {output_dir}")
+    rank, world_size, local_rank = init_distributed()
 
-    # Run benchmark with native Megatron APIs
-    run_benchmark(model_cfg, replicator_cfg, exp_cfg.train, output_dir)
+    if rank == 0:
+        print(f"\n{'=' * 60}")
+        print(f"DeToNATION Benchmark (Megatron-FSDP)")
+        print(f"{'=' * 60}")
+        print(f"  Experiment:  {exp_cfg.name}")
+        print(f"  Model:       {model_cfg.name} ({model_cfg.hf_id})")
+        print(f"  Replicator:  {replicator_cfg.strategy}")
+        print(f"  Hardware:    {hw_cfg.nodes} nodes x {hw_cfg.gpus_per_node} GPUs")
+        print(f"  World size:  {world_size}")
+        print(f"  Output:      {output_dir}")
+        print(f"{'=' * 60}\n")
+
+    try:
+        run_benchmark(model_cfg, replicator_cfg, exp_cfg.train, output_dir, rank, world_size)
+        if rank == 0:
+            print(f"\n  Benchmark '{replicator_cfg.strategy}' completed successfully.\n")
+    except Exception:
+        if rank == 0:
+            print(f"\n  Benchmark '{replicator_cfg.strategy}' FAILED.\n")
+            traceback.print_exc()
+        dist.barrier()
+        raise
+    finally:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
     main()
-
-
-"""
-cd /opt  # or your preferred directory
-git clone --recursive https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
-cd Megatron-Bridge
-
-# Make sure submodules are initialized
-git submodule update --init --recursive
-
-# Install the package
-pip install -e .
-"""
