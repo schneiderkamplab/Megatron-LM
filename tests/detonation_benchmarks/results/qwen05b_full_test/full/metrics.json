@@ -1,0 +1,11 @@
+{
+  "model": "qwen2.5-0.5b",
+  "hf_id": "Qwen/Qwen2.5-0.5B",
+  "strategy": "full",
+  "train_iters": 50,
+  "total_time_sec": 29.6,
+  "throughput_iters_per_sec": 1.69,
+  "final_loss": 0.384538,
+  "world_size": 2,
+  "model_params_millions": 494.03
+}

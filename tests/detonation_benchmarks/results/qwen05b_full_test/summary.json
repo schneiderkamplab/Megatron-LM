@@ -1,0 +1,34 @@
+{
+  "results": [
+    {
+      "strategy": "none",
+      "status": "PASS",
+      "exit_code": 0
+    },
+    {
+      "strategy": "full",
+      "status": "PASS",
+      "exit_code": 0
+    },
+    {
+      "strategy": "demo",
+      "status": "PASS",
+      "exit_code": 0
+    },
+    {
+      "strategy": "slicing",
+      "status": "PASS",
+      "exit_code": 0
+    },
+    {
+      "strategy": "striding",
+      "status": "PASS",
+      "exit_code": 0
+    },
+    {
+      "strategy": "random",
+      "status": "PASS",
+      "exit_code": 0
+    }
+  ]
+}

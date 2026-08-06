@@ -1,0 +1,58 @@
+W0805 21:27:32.159000 1679625 site-packages/torch/distributed/run.py:851] 
+W0805 21:27:32.159000 1679625 site-packages/torch/distributed/run.py:851] *****************************************
+W0805 21:27:32.159000 1679625 site-packages/torch/distributed/run.py:851] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0805 21:27:32.159000 1679625 site-packages/torch/distributed/run.py:851] *****************************************
+
+============================================================
+DeToNATION Benchmark (Megatron-FSDP)
+============================================================
+  Experiment:  qwen05b
+  Model:       qwen2.5-0.5b (Qwen/Qwen2.5-0.5B)
+  Replicator:  full
+  Hardware:    1 nodes x 2 GPUs
+  World size:  2
+  Output:      tests/detonation_benchmarks/results/qwen05b_full_test/full
+============================================================
+
+/mnt/odinstorage/users/jnn/codes/Megatron-LM/megatron/core/optimizer/__init__.py:25: UserWarning: Transformer Engine and Apex are not installed. Falling back to Torch optimizers.
+  warnings.warn(
+/mnt/odinstorage/users/jnn/codes/Megatron-LM/megatron/core/distributed/fsdp/src/megatron_fsdp/mixed_precision.py:115: UserWarning: Transformer Engine and Apex are not installed. Falling back to local implementations of multi_tensor_applier and multi_tensor_scale
+  warnings.warn(
+/mnt/odinstorage/users/jnn/codes/Megatron-LM/megatron/core/optimizer/optimizer.py:29: UserWarning: Transformer Engine and Apex are not installed. Falling back to local implementations of multi_tensor_applier and multi_tensor_scale
+  warnings.warn(
+/mnt/odinstorage/users/jnn/codes/Megatron-LM/megatron/core/optimizer/clip_grads.py:32: UserWarning: Transformer Engine and Apex are not installed. Falling back to local implementations of multi_tensor_applier, multi_tensor_l2norm, and multi_tensor_scale
+  warnings.warn(
+/mnt/odinstorage/users/jnn/codes/Megatron-LM/megatron/core/optimizer/__init__.py:25: UserWarning: Transformer Engine and Apex are not installed. Falling back to Torch optimizers.
+  warnings.warn(
+/mnt/odinstorage/users/jnn/codes/Megatron-LM/megatron/core/distributed/fsdp/src/megatron_fsdp/mixed_precision.py:115: UserWarning: Transformer Engine and Apex are not installed. Falling back to local implementations of multi_tensor_applier and multi_tensor_scale
+  warnings.warn(
+/mnt/odinstorage/users/jnn/codes/Megatron-LM/megatron/core/optimizer/optimizer.py:29: UserWarning: Transformer Engine and Apex are not installed. Falling back to local implementations of multi_tensor_applier and multi_tensor_scale
+  warnings.warn(
+/mnt/odinstorage/users/jnn/codes/Megatron-LM/megatron/core/optimizer/clip_grads.py:32: UserWarning: Transformer Engine and Apex are not installed. Falling back to local implementations of multi_tensor_applier, multi_tensor_l2norm, and multi_tensor_scale
+  warnings.warn(
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/290 [00:00<?, ?it/s]Loading weights:   0%|          | 0/290 [00:00<?, ?it/s]Loading weights:   0%|          | 1/290 [00:00<01:40,  2.87it/s]Loading weights: 100%|██████████| 290/290 [00:00<00:00, 713.11it/s]
+Loading weights:   0%|          | 1/290 [00:00<01:46,  2.73it/s]Loading weights: 100%|██████████| 290/290 [00:00<00:00, 746.38it/s]
+  Model: Qwen/Qwen2.5-0.5B (~494.0M params)
+  FSDP unit modules: ['Qwen2DecoderLayer']
+    iter    0  loss=11.2119
+    iter   10  loss=1.1973
+    iter   20  loss=0.7574
+    iter   30  loss=0.6270
+    iter   40  loss=0.3928
+  Metrics written to tests/detonation_benchmarks/results/qwen05b_full_test/full/metrics.json
+{
+  "model": "qwen2.5-0.5b",
+  "hf_id": "Qwen/Qwen2.5-0.5B",
+  "strategy": "full",
+  "train_iters": 50,
+  "total_time_sec": 29.6,
+  "throughput_iters_per_sec": 1.69,
+  "final_loss": 0.384538,
+  "world_size": 2,
+  "model_params_millions": 494.03
+}
+
+  Benchmark 'full' completed successfully.
+

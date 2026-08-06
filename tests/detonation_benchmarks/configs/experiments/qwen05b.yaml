@@ -1,0 +1,37 @@
+name: qwen05b
+
+train:
+  train_iters: 50
+  global_batch_size: 2
+  micro_batch_size: 1
+
+models:
+  - name: qwen2.5-0.5b
+    hf_id: Qwen/Qwen2.5-0.5B
+    tp: 1
+    pp: 1
+    seq_length: 512
+
+replicators:
+  - strategy: none
+  - strategy: full
+  - strategy: demo
+    topk: 32
+    chunk: 64
+    decay: 0.999
+  - strategy: slicing
+    rate: 0.1
+    chunk: 64
+    decay: 0.999
+  - strategy: striding
+    rate: 0.1
+    chunk: 64
+    decay: 0.999
+  - strategy: random
+    rate: 0.1
+    decay: 0.999
+    seed: 42
+
+hardware:
+  - nodes: 1
+    gpus_per_node: 2
