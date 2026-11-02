@@ -54,13 +54,15 @@ def make_grad(rank: int, step: int, device) -> torch.Tensor:
     return torch.randn(NUMEL, generator=g).to(device)
 
 
-def simulate(world_size, num_steps, delays, max_delay, device, seed=42):
+def simulate(world_size, num_steps, delays, max_delay, device, seed=42, adaptive=False):
     """Reference: per-step expected replicated gradient on every rank.
 
     The result sent at step s completes at step s + delays[s]. Collectives
     complete in issue order, so a result is applied at the first step where it
     and every earlier result have completed, unless it is more than max_delay
-    steps old by then, in which case it is dropped.
+    steps old by then, in which case it is dropped. With adaptive=True,
+    results are also drained at the end of each step (finalize_step), so a
+    result that completes in the step it was sent is applied in that step.
     """
     repl = RandomBucketReplicator(compression_decay=DECAY, compression_rate=RATE,
                                   seed=seed, max_delay=max_delay)
@@ -91,10 +93,14 @@ def simulate(world_size, num_steps, delays, max_delay, device, seed=42):
             expected[step] += sent  # Synchronous: applied in the step it was sent.
         else:
             in_flight.append((step, sent))
+            if adaptive:
+                # End-of-step finalize drains everything completed by now.
+                while in_flight and step >= in_flight[0][0] + delays[in_flight[0][0]]:
+                    expected[step] += in_flight.pop(0)[1]
     return expected
 
 
-def run(delays, max_delay, rank, world_size, device, step_offset=0):
+def run(delays, max_delay, rank, world_size, device, step_offset=0, wait_s=0.0):
     num_steps = len(delays)
     repl = RandomBucketReplicator(compression_decay=DECAY, compression_rate=RATE,
                                   max_delay=max_delay)
@@ -117,6 +123,8 @@ def run(delays, max_delay, rank, world_size, device, step_offset=0):
             grad = make_grad(rank, step, device)
             stream.wait_stream(torch.cuda.current_stream())
             repl.replicate_bucket_group([0], lambda _: grad, stream).synchronize()
+            if wait_s > 0:
+                repl.finalize_step([0], lambda _: grad, wait_s)
             torch.cuda.synchronize()
             outputs.append(grad.clone())
     finally:
@@ -165,6 +173,17 @@ def main():
     for name, (delays, max_delay) in cases.items():
         expected = simulate(world_size, n, delays, max_delay, device)
         outputs = run(delays, max_delay, rank, world_size, device)
+        check(name, outputs, expected, rank)
+
+    # Adaptive synchronization: finalize_step applies results that complete in
+    # the step they were sent; later ones follow the usual delayed path.
+    adaptive_cases = {
+        "adaptive: all results in time": [0] * n,
+        "adaptive: mixed same-step and late": [0, 1, 0, 2, 0, 0, 1, 0, 3, 0, 0, 0],
+    }
+    for name, delays in adaptive_cases.items():
+        expected = simulate(world_size, n, delays, 4, device, adaptive=True)
+        outputs = run(delays, 4, rank, world_size, device, wait_s=0.3)
         check(name, outputs, expected, rank)
 
     # Undersampling forces the zero-padding path.

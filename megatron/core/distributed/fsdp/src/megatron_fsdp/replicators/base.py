@@ -108,6 +108,24 @@ class BucketReplicator(ABC):
         """Called at the beginning of each training step, before gradient reduction."""
         pass
 
+    def finalize_step(
+        self,
+        bucket_ids: List[int],
+        get_buffer_fn: Callable[[int], torch.Tensor],
+        deadline_s: float,
+    ) -> None:
+        """Give in-flight replication results a bounded chance to land in the
+        current step's gradients.
+
+        Called once per step after all bucket groups have replicated and right
+        before the optimizer runs. An asynchronous replicator should poll its
+        pending collectives for up to ``deadline_s`` seconds and apply every
+        result that has completed; anything still in flight is left for the
+        usual delayed-application path. Default is a no-op, which is correct
+        for synchronous and stateless replicators.
+        """
+        pass
+
     def post_step(self) -> None:
         """Called after optimizer.step() completes."""
         pass

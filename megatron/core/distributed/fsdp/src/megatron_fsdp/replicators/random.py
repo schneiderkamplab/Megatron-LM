@@ -4,6 +4,7 @@ from collections import OrderedDict, deque
 from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 import math
+import time
 
 import torch
 import torch.distributed as dist
@@ -178,6 +179,34 @@ class RandomBucketReplicator(BucketReplicator):
                 handle.wait()
             pending.popleft()
             self._apply_result(bucket_id, sent_step, payload, grad)
+
+    def finalize_step(
+        self,
+        bucket_ids: List[int],
+        get_buffer_fn: Callable[[int], torch.Tensor],
+        deadline_s: float,
+    ) -> None:
+        """Apply any results that completed by the end of the step, so a fast
+        network makes the replicator effectively synchronous. Results still in
+        flight after ``deadline_s`` are applied by later steps as usual."""
+        if self.max_delay == 0:
+            return
+        end = time.monotonic() + deadline_s
+        remaining = [b for b in bucket_ids if self._pending.get(b)]
+        while remaining:
+            still_pending = []
+            for bucket_id in remaining:
+                pending = self._pending[bucket_id]
+                grad = get_buffer_fn(bucket_id)
+                while pending and pending[0][1].is_completed():
+                    sent_step, handle, payload = pending.popleft()
+                    handle.wait()  # Orders the current stream after the collective.
+                    self._apply_result(bucket_id, sent_step, payload, grad)
+                if pending:
+                    still_pending.append(bucket_id)
+            remaining = still_pending
+            if remaining and time.monotonic() >= end:
+                break
 
     def replicate_bucket_group(
         self,

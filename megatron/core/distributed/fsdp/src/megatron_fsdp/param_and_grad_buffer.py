@@ -3240,6 +3240,9 @@ class GradReducePipeline:
                 param_and_grad_buffer.dist_index.get_outer_fsdp_group().size()
             )
 
+        # Buckets replicated since the last finalize_replication() call.
+        self.replicated_bucket_ids = set()
+
         # Init outer-DP group gradient reduction related attributes.
         dist_index = self.buffer.dist_index
         if dist_index.use_hybrid_fsdp:
@@ -3257,6 +3260,33 @@ class GradReducePipeline:
     def num_buckets(self):
         """Return the number of buckets."""
         return self.buffer.num_buckets
+
+    def finalize_replication(self):
+        """Complete this step's replication before the optimizer runs.
+
+        Gives in-flight replication results up to replication_wait_ms to be
+        applied in the step they were sent for (an asynchronous replicator
+        falls back to its delayed-application path for anything that misses
+        the deadline), then applies the optional DeToNATION sign step to every
+        bucket that was replicated this step.
+        """
+        if self.replicator is None or not self.replicated_bucket_ids:
+            return
+        bucket_ids = sorted(self.replicated_bucket_ids)
+        self.replicated_bucket_ids.clear()
+
+        def get_replicator_buffer(bucket_id):
+            return self.get_fsdp_buffer(bucket_id).data
+
+        ddp_config = self.buffer.ddp_config
+        if ddp_config.replication_wait_ms > 0:
+            self.replicator.finalize_step(
+                bucket_ids, get_replicator_buffer, ddp_config.replication_wait_ms / 1000.0
+            )
+        if ddp_config.replication_sign:
+            # DeToNATION sign step: the optimizer sees sign(replicated gradient).
+            for bucket_id in bucket_ids:
+                get_replicator_buffer(bucket_id).sign_()
 
     def reset(self):
         """Handle the processing tasks and reset the pipeline."""
@@ -3555,10 +3585,10 @@ class GradReducePipeline:
                     )
                     if replication_event is not None:
                         reduce_scatter_view_out_event = replication_event
-                    if ddp_config.replication_sign:
-                        # DeToNATION sign step: the optimizer sees sign(replicated gradient).
-                        for bucket_id in bucket_group:
-                            get_replicator_buffer(bucket_id).sign_()
+                # The optional DeToNATION sign step is applied by
+                # finalize_replication(), after in-flight results have had a
+                # last chance to land in this step's gradients.
+                self.replicated_bucket_ids.update(bucket_group)
             else:
                 # Standard Megatron-LM DP-Outer communication path.
                 outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group()

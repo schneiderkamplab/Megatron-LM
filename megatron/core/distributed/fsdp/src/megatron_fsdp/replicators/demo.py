@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from typing import Callable, Dict, List, Optional, Tuple
+import time
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.distributed as dist
@@ -76,6 +77,9 @@ class DeMoBucketReplicator(BucketReplicator):
         self._pending: Dict[
             int, Tuple[dist.Work, dist.Work, list, list, torch.Tensor, int]
         ] = {}
+        # Buckets whose result was already applied in the step it was sent
+        # (by finalize_step), so the next replicate call must not zero-fill.
+        self._fresh: Set[int] = set()
 
     def pre_step(self) -> None:
         pass
@@ -86,24 +90,52 @@ class DeMoBucketReplicator(BucketReplicator):
     def wait_pending(self, bucket_id: int) -> bool:
         if bucket_id not in self._pending:
             return False
+        self._decode_pending(bucket_id)
+        return True
 
+    def _decode_pending(self, bucket_id: int, target: Optional[torch.Tensor] = None) -> None:
+        """Decode a completed gather into `target` (defaults to the gradient
+        buffer that was current when the gather was posted; pass the current
+        buffer explicitly, as bucket storage may have been reallocated since)."""
         idx_handle, val_handle, idx_bufs, val_bufs, result_buf, numel = self._pending.pop(
             bucket_id
         )
         idx_handle.wait()
         val_handle.wait()
-
-        # Batch decompress: average all nodes' sparse data
         idx_long = [b.to(torch.int64) for b in idx_bufs]
         averaged = DCTBufferCompress.batch_decompress(
             idx_long, val_bufs, numel, self._device, self._dtype
         )
+        if target is None:
+            target = result_buf
+        target.copy_(self._transform.decode(bucket_id, averaged))
 
-        # Inverse DCT to get the replicated gradient
-        result_buf.copy_(
-            self._transform.decode(bucket_id, averaged)
-        )
-        return True
+    def finalize_step(
+        self,
+        bucket_ids: List[int],
+        get_buffer_fn: Callable[[int], torch.Tensor],
+        deadline_s: float,
+    ) -> None:
+        """Decode this step's gathers if they complete in time, making the
+        replicator synchronous whenever the network keeps up. A bucket that
+        misses the deadline keeps the local gradient for this step and its
+        result is decoded at the next step as usual."""
+        if self.synchronous or self._world_size <= 1:
+            return
+        end = time.monotonic() + deadline_s
+        remaining = [b for b in bucket_ids if b in self._pending]
+        while remaining:
+            still_pending = []
+            for bucket_id in remaining:
+                idx_handle, val_handle = self._pending[bucket_id][:2]
+                if idx_handle.is_completed() and val_handle.is_completed():
+                    self._decode_pending(bucket_id, get_buffer_fn(bucket_id))
+                    self._fresh.add(bucket_id)
+                else:
+                    still_pending.append(bucket_id)
+            remaining = still_pending
+            if remaining and time.monotonic() >= end:
+                break
 
     def replicate_bucket_group(
         self,
@@ -135,24 +167,12 @@ class DeMoBucketReplicator(BucketReplicator):
                     bucket_id, grad, lr, self.compression_decay
                 )
 
-                # Resolve previous step's result
+                # Resolve previous step's result. The stored result buffer is
+                # this bucket's persistent gradient buffer, so the decoded
+                # result lands in `grad`.
                 had_pending = bucket_id in self._pending
                 if had_pending:
-                    idx_handle, val_handle, idx_bufs, val_bufs, result_buf, numel = self._pending.pop(
-                        bucket_id
-                    )
-                    idx_handle.wait()
-                    val_handle.wait()
-
-                    # Batch decompress
-                    idx_long = [b.to(torch.int64) for b in idx_bufs]
-                    averaged = DCTBufferCompress.batch_decompress(
-                        idx_long, val_bufs, numel, self._device, self._dtype
-                    )
-                    # Write decoded result into the gradient buffer
-                    grad.copy_(
-                        self._transform.decode(bucket_id, averaged)
-                    )
+                    self._decode_pending(bucket_id, grad)
 
                 # DCT encode the delta
                 encoded = self._transform.encode(bucket_id, delta)
@@ -210,8 +230,15 @@ class DeMoBucketReplicator(BucketReplicator):
                 )
 
                 if not had_pending:
-                    # First step: no result available, zero-fill
-                    grad.zero_()
+                    if bucket_id in self._fresh:
+                        # Last step's result was applied in that same step, so
+                        # nothing is pending. Keep the local gradient as the
+                        # estimate; finalize_step replaces it with the decoded
+                        # result if the gathers complete in time.
+                        self._fresh.discard(bucket_id)
+                    else:
+                        # First step: no result available, zero-fill
+                        grad.zero_()
 
             event = stream.record_event()
 

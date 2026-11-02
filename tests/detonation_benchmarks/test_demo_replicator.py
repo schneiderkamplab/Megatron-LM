@@ -59,7 +59,7 @@ def reference_updates(device):
     return updates
 
 
-def run(synchronous: bool, device):
+def run(synchronous: bool, device, wait_s: float = 0.0):
     repl = DeMoBucketReplicator(compression_decay=DECAY, compression_topk=TOPK,
                                 compression_chunk=CHUNK, synchronous=synchronous)
     repl.init(dist.group.WORLD, {0: NUMEL}, torch.float32, device, lambda: LR)
@@ -70,6 +70,8 @@ def run(synchronous: bool, device):
         stream.wait_stream(torch.cuda.current_stream())
         event = repl.replicate_bucket_group([0], lambda _: grad, stream)
         event.synchronize()
+        if wait_s > 0:
+            repl.finalize_step([0], lambda _: grad, wait_s)
         torch.cuda.synchronize()
         outputs.append(grad.clone())
     return outputs
@@ -95,6 +97,10 @@ def main():
     check("synchronous demo applies step s in step s", run(True, device), updates, rank)
     delayed = [torch.zeros(NUMEL, device=device)] + updates[:-1]
     check("async demo applies step s in step s + 1", run(False, device), delayed, rank)
+    # With finalize_step the gathers complete within the step, so adaptive
+    # async demo matches the synchronous result.
+    check("adaptive demo applies step s in step s", run(False, device, wait_s=2.0),
+          updates, rank)
 
     dist.barrier()
     dist.destroy_process_group()
