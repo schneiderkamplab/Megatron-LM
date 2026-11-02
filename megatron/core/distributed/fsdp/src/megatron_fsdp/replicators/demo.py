@@ -20,8 +20,9 @@ class DeMoBucketReplicator(BucketReplicator):
     and asynchronously all_gathers sparse indices/values across nodes.
 
     On the next step, the gathered sparse data from all nodes is decoded
-    to produce the replicated gradient. This introduces a one-step delay
-    (identical to the original DeToNation design).
+    to produce the replicated gradient. This introduces a one-step delay.
+    With ``synchronous=True`` the all_gather is waited on and the result is
+    used in the same step, as in the reference DeToNATION implementation.
     """
 
     def __init__(
@@ -29,6 +30,7 @@ class DeMoBucketReplicator(BucketReplicator):
         compression_decay: float = 0.999,
         compression_topk: int = 32,
         compression_chunk: int = 64,
+        synchronous: bool = False,
     ):
         if compression_topk <= 0:
             raise ValueError("compression_topk must be positive")
@@ -42,6 +44,7 @@ class DeMoBucketReplicator(BucketReplicator):
         self.compression_decay = compression_decay
         self.compression_topk = compression_topk
         self.compression_chunk = compression_chunk
+        self.synchronous = synchronous
 
     def init(
         self,
@@ -177,6 +180,17 @@ class DeMoBucketReplicator(BucketReplicator):
                 val_gather_buf = [
                     torch.zeros_like(sparse_val) for _ in range(self._world_size)
                 ]
+
+                if self.synchronous:
+                    # Gather, average and decode this step's sparse data now.
+                    dist.all_gather(idx_gather_buf, sparse_idx, group=self._process_group)
+                    dist.all_gather(val_gather_buf, sparse_val, group=self._process_group)
+                    averaged = DCTBufferCompress.batch_decompress(
+                        [b.to(torch.int64) for b in idx_gather_buf], val_gather_buf,
+                        numel, self._device, self._dtype,
+                    )
+                    grad.copy_(self._transform.decode(bucket_id, averaged))
+                    continue
                 idx_handle = dist.all_gather(
                     idx_gather_buf, sparse_idx,
                     group=self._process_group, async_op=True,

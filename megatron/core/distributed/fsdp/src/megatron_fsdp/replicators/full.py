@@ -17,12 +17,15 @@ class FullBucketReplicator(BucketReplicator):
     using an asynchronous all_reduce. Results from the previous step are
     resolved before posting new communications (one-step-delay pattern).
 
-    This replicator serves as the correctness baseline — it should produce
-    numerically identical results to the standard Megatron-LM DP-Outer
-    all_reduce.
+    With synchronous=True the all_reduce blocks and the result is applied in
+    the same step, through the same clone/copy path as the asynchronous mode,
+    so the two modes differ only in the one-step delay. It is then numerically
+    equivalent to FullSyncBucketReplicator (which reduces in place without the
+    staging copies) and to the standard Megatron-LM DP-Outer all_reduce.
     """
 
-    def __init__(self):
+    def __init__(self, synchronous: bool = False):
+        self.synchronous = synchronous
         self._process_group: Optional[dist.ProcessGroup] = None
         self._world_size: int = 1
         self._pending: Dict[int, Tuple[dist.Work, torch.Tensor]] = {}
@@ -65,6 +68,13 @@ class FullBucketReplicator(BucketReplicator):
                 # Clone the CURRENT gradient before overwriting the buffer
                 # with the previous step's result.
                 comm_buffer = grad.clone()
+
+                if self.synchronous:
+                    dist.all_reduce(
+                        comm_buffer, op=dist.ReduceOp.AVG, group=self._process_group
+                    )
+                    grad.copy_(comm_buffer)
+                    continue
 
                 # Resolve previous step's async all_reduce.
                 had_pending = bucket_id in self._pending
