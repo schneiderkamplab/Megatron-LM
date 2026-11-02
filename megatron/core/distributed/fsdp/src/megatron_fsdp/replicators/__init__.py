@@ -8,6 +8,7 @@ __all__ = [
     "DeltaBufferManager",
     "NoOpBucketReplicator",
     "FullBucketReplicator",
+    "FullSyncBucketReplicator",
     "DeMoBucketReplicator",
     "SlicingBucketReplicator",
     "StridingBucketReplicator",
@@ -24,6 +25,7 @@ def get_replicator(
     compression_chunk: int = 64,
     compression_rate: float = 0.1,
     seed: int = 42,
+    max_delay: int = 4,
 ) -> BucketReplicator:
     """Factory function to create a BucketReplicator by strategy name.
 
@@ -31,6 +33,7 @@ def get_replicator(
         strategy: Replication strategy name. Valid values:
             'none' - No replication (passthrough).
             'full' - Full gradient all-reduce.
+            'full_sync' - Full gradient all-reduce without the one-step delay (diagnostic).
             'demo' - DeMo DCT compression.
             'slicing' - Cyclic chunk slicing.
             'striding' - Strided sampling.
@@ -40,6 +43,8 @@ def get_replicator(
         compression_chunk: Chunk size for DeMo/slicing/striding (default 64).
         compression_rate: Fraction for slicing/striding/random (default 0.1).
         seed: Random seed for random replicator (default 42).
+        max_delay: Steps an async random-replicator result may lag before it is
+            dropped (default 4). 0 makes the full, random and demo replicators synchronous.
 
     Returns:
         A BucketReplicator instance.
@@ -49,7 +54,11 @@ def get_replicator(
     elif strategy == "full":
         from .full import FullBucketReplicator
 
-        return FullBucketReplicator()
+        return FullBucketReplicator(synchronous=max_delay == 0)
+    elif strategy == "full_sync":
+        from .full_sync import FullSyncBucketReplicator
+
+        return FullSyncBucketReplicator()
     elif strategy == "demo":
         from .demo import DeMoBucketReplicator
 
@@ -57,6 +66,7 @@ def get_replicator(
             compression_decay=compression_decay,
             compression_topk=compression_topk,
             compression_chunk=compression_chunk,
+            synchronous=max_delay == 0,
         )
     elif strategy == "slicing":
         from .slicing import SlicingBucketReplicator
@@ -81,9 +91,10 @@ def get_replicator(
             compression_decay=compression_decay,
             compression_rate=compression_rate,
             seed=seed,
+            max_delay=max_delay,
         )
     else:
         raise ValueError(
             f"Unknown replication strategy: '{strategy}'. "
-            f"Valid values: 'none', 'full', 'demo', 'slicing', 'striding', 'random'."
+            f"Valid values: 'none', 'full', 'full_sync', 'demo', 'slicing', 'striding', 'random'."
         )

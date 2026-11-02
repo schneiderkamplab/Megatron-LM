@@ -220,6 +220,15 @@ class DistributedDataParallelConfig:
     replication_seed: int = 42
     """Random seed for the random replicator."""
 
+    replication_max_delay: int = 4
+    """Number of steps an asynchronous random-replicator result may arrive late. Each
+      rank keeps the selected indices of this many recent steps; later results are
+      dropped. 0 makes the full, random and demo replicators synchronous."""
+
+    replication_sign: bool = False
+    """Replace the replicated gradient by its sign, as DeToNATION's optimizers do by
+      default (detonation_sign=True). Only applies when replication_strategy != 'none'."""
+
     def __post_init__(self):
         import os
 

@@ -3226,6 +3226,19 @@ class GradReducePipeline:
         # DeToNation replicator for inter-node gradient compression.
         self.replicator = replicator
         self.standalone_replication_group = standalone_replication_group
+        # Replicators average across DP-Outer, but unless average_in_collective is set,
+        # the DP-Shard reduction pre-scales gradients by 1/(DP-Shard x DP-Outer) for a
+        # native DP-Outer SUM. Undo the DP-Outer factor so replicators see the
+        # DP-Shard mean gradient.
+        self.replicator_grad_scale = 1.0
+        if (
+            replicator is not None
+            and param_and_grad_buffer.dist_index.use_hybrid_fsdp
+            and not param_and_grad_buffer.ddp_config.average_in_collective
+        ):
+            self.replicator_grad_scale = float(
+                param_and_grad_buffer.dist_index.get_outer_fsdp_group().size()
+            )
 
         # Init outer-DP group gradient reduction related attributes.
         dist_index = self.buffer.dist_index
@@ -3532,6 +3545,9 @@ class GradReducePipeline:
                     return self.get_fsdp_buffer(bucket_id).data
 
                 with torch.cuda.stream(self.outer_fsdp_group_grad_reduce_stream):
+                    if self.replicator_grad_scale != 1.0:
+                        for bucket_id in bucket_group:
+                            get_replicator_buffer(bucket_id).mul_(self.replicator_grad_scale)
                     replication_event = self.replicator.replicate_bucket_group(
                         bucket_group,
                         get_replicator_buffer,
@@ -3539,6 +3555,10 @@ class GradReducePipeline:
                     )
                     if replication_event is not None:
                         reduce_scatter_view_out_event = replication_event
+                    if ddp_config.replication_sign:
+                        # DeToNATION sign step: the optimizer sees sign(replicated gradient).
+                        for bucket_id in bucket_group:
+                            get_replicator_buffer(bucket_id).sign_()
             else:
                 # Standard Megatron-LM DP-Outer communication path.
                 outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group()

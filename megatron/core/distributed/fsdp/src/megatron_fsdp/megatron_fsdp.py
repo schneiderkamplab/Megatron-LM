@@ -413,6 +413,7 @@ class MegatronFSDP(torch.nn.Module):
                 compression_chunk=getattr(self.ddp_config, 'replication_chunk', 64),
                 compression_rate=getattr(self.ddp_config, 'replication_rate', 0.1),
                 seed=getattr(self.ddp_config, 'replication_seed', 42),
+                max_delay=getattr(self.ddp_config, 'replication_max_delay', 4),
             )
 
             # Determine the replication process group.
@@ -428,18 +429,27 @@ class MegatronFSDP(torch.nn.Module):
                 )
                 self.standalone_replication_group = replication_group
 
-            # Compute bucket sizes for replicator init.
+            # Compute bucket sizes for replicator init. These must match the buffer
+            # GradReducePipeline.get_fsdp_buffer() hands to the replicator: hsdp_gbuf
+            # (DP-Shard sharded) when outer_dp_sharding_strategy != "no_shard",
+            # otherwise main_grad_buffer.
             bucket_sizes = {}
             dtype = self.mp_policy.grad_comm_dtype or torch.float32
             for bucket_id in range(self.param_and_grad_buffer.num_buckets):
-                gbuf = self.param_and_grad_buffer.parameter_groups[bucket_id].main_grad_buffer
+                group = self.param_and_grad_buffer.parameter_groups[bucket_id]
+                gbuf = group.hsdp_gbuf if group.hsdp_gbuf is not None else group.main_grad_buffer
                 if gbuf is not None:
                     bucket_sizes[bucket_id] = gbuf.data.numel()
 
-            # Learning rate provider: will be set during optimizer wiring.
-            self._current_lr = [0.0]
+            # Learning rate provider. fully_shard_optimizer() registers the optimizer
+            # here; the LR is read live because the replicator runs during backward
+            # (before optimizer.step()), so a value cached in step() would lag a step.
+            self.replicator_optimizer = None
+
             def lr_provider():
-                return self._current_lr[0]
+                if self.replicator_optimizer is None:
+                    return 0.0
+                return self.replicator_optimizer.param_groups[0].get("lr", 0.0)
 
             self.replicator.init(
                 process_group=replication_group,
@@ -647,7 +657,7 @@ class MegatronFSDP(torch.nn.Module):
                 return
 
             # Sharded Gradient Buffer
-            gbuf = group.hfsdp_helper_gbuf if group.hfsdp_helper_gbuf else group.main_grad_buffer
+            gbuf = group.hsdp_gbuf if group.hsdp_gbuf else group.main_grad_buffer
             if gbuf.is_data_distributed:
                 if not param.grad_added_to_main_grad:
                     # Get `main_grad` will allocate bucket, check that the currently
