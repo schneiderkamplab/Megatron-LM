@@ -65,6 +65,17 @@ class DeltaBufferManager:
         """Zero out the delta for a bucket."""
         self.deltas[bucket_id].zero_()
 
+    def state_dict(self) -> Dict[int, torch.Tensor]:
+        """This rank's delta buffers, by bucket."""
+        return dict(self.deltas)
+
+    def load_state_dict(self, state_dict: Dict[int, torch.Tensor]) -> None:
+        """Restore delta buffers saved by state_dict() with the same bucket layout."""
+        if state_dict.keys() != self.deltas.keys():
+            raise ValueError("delta buffers were saved with a different bucket layout")
+        for bucket_id, delta in state_dict.items():
+            self.deltas[bucket_id].copy_(delta)
+
 
 class BucketReplicator(ABC):
     """Abstract base class for bucket-level gradient replicators.
@@ -139,6 +150,21 @@ class BucketReplicator(ABC):
     def post_step(self) -> None:
         """Called after optimizer.step() completes."""
         pass
+
+    def state_dict(self) -> Dict[str, object]:
+        """This rank's replicator state for resuming training: the delta buffers
+        of compression-based replicators. Results still in flight are not
+        included, so they are lost on resume. Call between training steps."""
+        delta_manager = getattr(self, "_delta_manager", None)
+        return {"deltas": delta_manager.state_dict()} if delta_manager is not None else {}
+
+    def load_state_dict(self, state_dict: Dict[str, object]) -> None:
+        """Restore state saved by state_dict() on the same rank, after init()."""
+        delta_manager = getattr(self, "_delta_manager", None)
+        if ("deltas" in state_dict) != (delta_manager is not None):
+            raise ValueError("replicator state was saved by a different replicator type")
+        if delta_manager is not None:
+            delta_manager.load_state_dict(state_dict["deltas"])
 
     @abstractmethod
     def replicate_bucket_group(

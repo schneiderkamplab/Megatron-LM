@@ -108,6 +108,15 @@ class RandomBucketReplicator(BucketReplicator):
         stats, self._stats = self._stats, {"fresh": 0, "late": 0, "dropped": 0}
         return stats
 
+    def state_dict(self) -> Dict[str, object]:
+        # The step counters drive the selection and the step tags, so a resumed
+        # run must continue them.
+        return {**super().state_dict(), "steps": dict(self._steps)}
+
+    def load_state_dict(self, state_dict: Dict[str, object]) -> None:
+        super().load_state_dict({k: v for k, v in state_dict.items() if k != "steps"})
+        self._steps = dict(state_dict["steps"])
+
     def _select_indices(self, bucket_id: int, step: int, numel: int) -> Tuple[torch.Tensor, int]:
         """Select int(compression_rate * numel) random elements, deterministically from
         (seed, bucket, step).
