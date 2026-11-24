@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import time
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -16,7 +16,9 @@ class FullBucketReplicator(BucketReplicator):
 
     Sends the complete sharded gradient buffer across the inter-node group
     using an asynchronous all_reduce. Results from the previous step are
-    resolved before posting new communications (one-step-delay pattern).
+    resolved before posting new communications (one-step-delay pattern);
+    with finalize_step, a result that completes within its own step is
+    applied in that step instead. Either way each result is applied once.
 
     With synchronous=True the all_reduce blocks and the result is applied in
     the same step, through the same clone/copy path as the asynchronous mode,
@@ -30,10 +32,7 @@ class FullBucketReplicator(BucketReplicator):
         self._process_group: Optional[dist.ProcessGroup] = None
         self._world_size: int = 1
         self._pending: Dict[int, Tuple[dist.Work, torch.Tensor]] = {}
-        # Buckets whose result was already applied in the step it was sent
-        # (by finalize_step), so the next replicate call must not reapply or
-        # zero-fill them.
-        self._fresh: Set[int] = set()
+        self._stats = {"fresh": 0, "late": 0, "dropped": 0}
 
     def init(
         self,
@@ -56,18 +55,26 @@ class FullBucketReplicator(BucketReplicator):
         # Resolution is handled inline in replicate_bucket_group.
         return bucket_id in self._pending
 
+    def pop_stats(self) -> Dict[str, int]:
+        stats, self._stats = self._stats, {"fresh": 0, "late": 0, "dropped": 0}
+        return stats
+
     def finalize_step(
         self,
         bucket_ids: List[int],
         get_buffer_fn: Callable[[int], torch.Tensor],
         deadline_s: float,
     ) -> None:
-        """Apply this step's all-reduce results if they complete in time, making
-        the replicator synchronous whenever the network keeps up. A bucket that
-        misses the deadline keeps the local gradient for this step and its
-        global result is applied at the next step as usual."""
+        """Add this step's all-reduce results to the gradient if they complete
+        in time, making the replicator synchronous whenever the network keeps
+        up. A result that misses the deadline is added at the next step
+        instead, so every result is applied exactly once."""
         if self.synchronous or self._world_size <= 1:
             return
+        # Cutoff: when the step's gradients exist on the GPU, which the CPU
+        # usually reaches early. The replication collectives run on their own
+        # streams, so this does not wait for them.
+        torch.cuda.current_stream().synchronize()
         end = time.monotonic() + deadline_s
         remaining = [b for b in bucket_ids if b in self._pending]
         while remaining:
@@ -77,8 +84,8 @@ class FullBucketReplicator(BucketReplicator):
                 if handle.is_completed():
                     handle.wait()  # Orders the current stream after the collective.
                     del self._pending[bucket_id]
-                    get_buffer_fn(bucket_id).copy_(comm_buffer)
-                    self._fresh.add(bucket_id)
+                    get_buffer_fn(bucket_id).add_(comm_buffer)
+                    self._stats["fresh"] += 1
                 else:
                     still_pending.append(bucket_id)
             remaining = still_pending
@@ -99,8 +106,8 @@ class FullBucketReplicator(BucketReplicator):
             for bucket_id in bucket_group:
                 grad = get_buffer_fn(bucket_id)
 
-                # Clone the CURRENT gradient before overwriting the buffer
-                # with the previous step's result.
+                # Clone the CURRENT gradient before the buffer is reused for
+                # the results that arrive.
                 comm_buffer = grad.clone()
 
                 if self.synchronous:
@@ -110,16 +117,16 @@ class FullBucketReplicator(BucketReplicator):
                     grad.copy_(comm_buffer)
                     continue
 
-                # Resolve previous step's async all_reduce.
-                had_pending = bucket_id in self._pending
-                if had_pending:
+                # The gradient buffer becomes the sum of the results that
+                # arrive: a late one from the previous step now, and this
+                # step's own if finalize_step sees it complete in time.
+                grad.zero_()
+                if bucket_id in self._pending:
                     handle, prev_buffer = self._pending.pop(bucket_id)
                     handle.wait()
-                    # Copy the averaged result into the gradient buffer
-                    # for the optimizer to use.
-                    grad.copy_(prev_buffer)
+                    grad.add_(prev_buffer)
+                    self._stats["late"] += 1
 
-                # Post new async all_reduce on the current gradient.
                 handle = dist.all_reduce(
                     comm_buffer,
                     op=dist.ReduceOp.AVG,
@@ -127,18 +134,6 @@ class FullBucketReplicator(BucketReplicator):
                     async_op=True,
                 )
                 self._pending[bucket_id] = (handle, comm_buffer)
-
-                if not had_pending:
-                    if bucket_id in self._fresh:
-                        # Last step's result was applied in that same step, so
-                        # there is nothing pending. Keep the local (DP-Shard
-                        # mean) gradient as the estimate; finalize_step
-                        # replaces it with the global result if it arrives in
-                        # time.
-                        self._fresh.discard(bucket_id)
-                    else:
-                        # First step: no result available, zero-fill.
-                        grad.zero_()
 
             event = stream.record_event()
 

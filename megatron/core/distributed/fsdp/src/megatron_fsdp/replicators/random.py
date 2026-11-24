@@ -93,6 +93,7 @@ class RandomBucketReplicator(BucketReplicator):
         self._pending: Dict[int, Deque[Tuple[int, dist.Work, torch.Tensor]]] = {
             bucket_id: deque() for bucket_id in bucket_sizes
         }
+        self._stats = {"fresh": 0, "late": 0, "dropped": 0}
 
     def pre_step(self) -> None:
         pass
@@ -102,6 +103,10 @@ class RandomBucketReplicator(BucketReplicator):
 
     def wait_pending(self, bucket_id: int) -> bool:
         return len(self._pending.get(bucket_id, ())) > 0
+
+    def pop_stats(self) -> Dict[str, int]:
+        stats, self._stats = self._stats, {"fresh": 0, "late": 0, "dropped": 0}
+        return stats
 
     def _select_indices(self, bucket_id: int, step: int, numel: int) -> Tuple[torch.Tensor, int]:
         """Select int(compression_rate * numel) random elements, deterministically from
@@ -145,13 +150,20 @@ class RandomBucketReplicator(BucketReplicator):
         return torch.tensor(digits, dtype=torch.float32, device=self._device)
 
     def _apply_result(
-        self, bucket_id: int, step: int, payload: torch.Tensor, grad: torch.Tensor
+        self, bucket_id: int, step: int, payload: torch.Tensor, grad: torch.Tensor,
+        kind: str = "late",
     ) -> None:
-        """Scatter-add a completed result into grad, if its indices are still known."""
+        """Scatter-add a completed result into grad, if its indices are still known.
+
+        `kind` ("fresh" or "late") is only counted for pop_stats(); a result whose
+        step tag mismatches is zeroed on device and still counted as applied.
+        """
         indices = self._recent_indices[bucket_id].get(step)
         if indices is None:
             # Arrived after its indices were evicted from the ring buffer: drop it.
+            self._stats["dropped"] += 1
             return
+        self._stats[kind] += 1
         values = payload[:-_TAG_NUMEL]
         # Checked on device to avoid a host sync; a mismatch zeroes the values.
         tag_ok = (payload[-_TAG_NUMEL:] == self._encode_tag(step)).all()
@@ -191,6 +203,10 @@ class RandomBucketReplicator(BucketReplicator):
         flight after ``deadline_s`` are applied by later steps as usual."""
         if self.max_delay == 0:
             return
+        # Cutoff: when the step's gradients exist on the GPU, which the CPU
+        # usually reaches early. The replication collectives run on their own
+        # streams, so this does not wait for them.
+        torch.cuda.current_stream().synchronize()
         end = time.monotonic() + deadline_s
         remaining = [b for b in bucket_ids if self._pending.get(b)]
         while remaining:
@@ -201,7 +217,7 @@ class RandomBucketReplicator(BucketReplicator):
                 while pending and pending[0][1].is_completed():
                     sent_step, handle, payload = pending.popleft()
                     handle.wait()  # Orders the current stream after the collective.
-                    self._apply_result(bucket_id, sent_step, payload, grad)
+                    self._apply_result(bucket_id, sent_step, payload, grad, "fresh")
                 if pending:
                     still_pending.append(bucket_id)
             remaining = still_pending
@@ -253,7 +269,7 @@ class RandomBucketReplicator(BucketReplicator):
                 )
                 if self.max_delay == 0:
                     handle.wait()
-                    self._apply_result(bucket_id, step, payload, grad)
+                    self._apply_result(bucket_id, step, payload, grad, "fresh")
                 else:
                     self._pending[bucket_id].append((step, handle, payload))
 

@@ -225,11 +225,14 @@ class DistributedDataParallelConfig:
       rank keeps the selected indices of this many recent steps; later results are
       dropped. 0 makes the full, random and demo replicators synchronous."""
 
-    replication_wait_ms: float = 0.0
-    """Milliseconds to wait, right before the optimizer step, for in-flight
-      asynchronous replication results so they apply in the step they were sent
-      for; results that miss the deadline follow the usual delayed path. 0
-      disables the wait entirely (pure asynchronous replication)."""
+    replication_wait_ms: Optional[float] = 0.0
+    """Adaptive synchronization for asynchronous replicators. Once the gradients
+      of a step have been computed and reduced within the node, in-flight
+      replication results that have already arrived are applied in the step they
+      were sent for; the rest are applied in the next step. A positive value
+      additionally waits up to this many milliseconds for the remaining results.
+      0 (the default) never waits. None disables adaptive synchronization: every
+      result is applied one step late."""
 
     replication_sign: bool = False
     """Replace the replicated gradient by its sign, as DeToNATION's optimizers do by

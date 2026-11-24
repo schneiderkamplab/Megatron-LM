@@ -4,7 +4,7 @@
 Synchronous applies the averaged gradient in the same step; asynchronous
 applies the previous step's average (one-step delay); adaptive (finalize_step)
 applies the current step's average when the collective completes in time, and
-keeps the local gradient for the step whenever it does not.
+otherwise adds it at the next step, so each average is applied exactly once.
 
 Usage:
     torchrun --nproc-per-node=2 tests/detonation_benchmarks/test_full_replicator.py
@@ -55,7 +55,7 @@ def make_avg(world_size: int, step: int, device) -> torch.Tensor:
     return torch.stack([make_grad(r, step, device) for r in range(world_size)]).mean(0)
 
 
-def run(delays, rank, world_size, device, synchronous=False, wait_s=0.0):
+def run(delays, rank, world_size, device, synchronous=False, wait_s=None):
     repl = FullBucketReplicator(synchronous=synchronous)
     repl.init(dist.group.WORLD, {0: NUMEL}, torch.float32, device, lambda: 0.0)
 
@@ -78,7 +78,10 @@ def run(delays, rank, world_size, device, synchronous=False, wait_s=0.0):
             grad = make_grad(rank, step, device)
             stream.wait_stream(torch.cuda.current_stream())
             repl.replicate_bucket_group([0], lambda _: grad, stream).synchronize()
-            if wait_s > 0:
+            if wait_s is not None:
+                # Let delay-0 collectives finish, as a network that keeps up with
+                # the backward pass would.
+                torch.cuda.synchronize()
                 repl.finalize_step([0], lambda _: grad, wait_s)
             torch.cuda.synchronize()
             outputs.append(grad.clone())
@@ -89,27 +92,14 @@ def run(delays, rank, world_size, device, synchronous=False, wait_s=0.0):
 
 
 def expected_adaptive(delays, rank, world_size, device):
-    """Reference for the adaptive mode: fresh average when the collective
-    completes within its step, stale average when one is pending from before,
-    the local gradient after a fresh step, zero only at the very start."""
-    out = []
-    pending = None
-    fresh = False
+    """Reference for the adaptive mode: each step's average is added in that
+    step if its collective completes in time, otherwise in the next step, so
+    every average is applied exactly once and nothing else is."""
+    out = [torch.zeros(NUMEL, device=device) for _ in delays]
     for step, delay in enumerate(delays):
-        if pending is not None:
-            value = make_avg(world_size, pending, device)
-            pending = None
-        elif fresh:
-            value = make_grad(rank, step, device)
-            fresh = False
-        else:
-            value = torch.zeros(NUMEL, device=device)
-        pending = step
-        if delay == 0:  # Completes within the step: finalize applies it.
-            value = make_avg(world_size, step, device)
-            pending = None
-            fresh = True
-        out.append(value)
+        target = step if delay == 0 else step + 1
+        if target < len(delays):
+            out[target] += make_avg(world_size, step, device)
     return out
 
 
@@ -147,6 +137,10 @@ def main():
     delays = [0, 1, 0, 0, 2, 0, 1, 0]
     outputs = run(delays, rank, world_size, device, wait_s=0.3)
     check("adaptive: mixed same-step and late", outputs,
+          expected_adaptive(delays, rank, world_size, device), rank)
+
+    outputs = run(delays, rank, world_size, device, wait_s=0.0)
+    check("adaptive, no wait: mixed same-step and late", outputs,
           expected_adaptive(delays, rank, world_size, device), rank)
 
     dist.barrier()

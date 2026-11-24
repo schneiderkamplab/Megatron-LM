@@ -3264,11 +3264,13 @@ class GradReducePipeline:
     def finalize_replication(self):
         """Complete this step's replication before the optimizer runs.
 
-        Gives in-flight replication results up to replication_wait_ms to be
-        applied in the step they were sent for (an asynchronous replicator
-        falls back to its delayed-application path for anything that misses
-        the deadline), then applies the optional DeToNATION sign step to every
-        bucket that was replicated this step.
+        Adaptive synchronization (replication_wait_ms not None): once the
+        step's gradients have been computed and reduced within the node, the
+        replication results that have already arrived are applied in the step
+        they were sent for; the rest follow the replicator's delayed path,
+        optionally after waiting up to replication_wait_ms for them. Then
+        applies the optional DeToNATION sign step to every bucket that was
+        replicated this step.
         """
         if self.replicator is None or not self.replicated_bucket_ids:
             return
@@ -3279,7 +3281,7 @@ class GradReducePipeline:
             return self.get_fsdp_buffer(bucket_id).data
 
         ddp_config = self.buffer.ddp_config
-        if ddp_config.replication_wait_ms > 0:
+        if ddp_config.replication_wait_ms is not None:
             self.replicator.finalize_step(
                 bucket_ids, get_replicator_buffer, ddp_config.replication_wait_ms / 1000.0
             )

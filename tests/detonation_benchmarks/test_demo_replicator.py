@@ -59,21 +59,55 @@ def reference_updates(device):
     return updates
 
 
-def run(synchronous: bool, device, wait_s: float = 0.0):
+class DelayedWork:
+    """Wraps a Work so is_completed() is False until `ready_step` is reached."""
+
+    def __init__(self, work, ready_step, clock):
+        self.work = work
+        self.ready_step = ready_step
+        self.clock = clock
+
+    def is_completed(self):
+        return self.clock["s"] >= self.ready_step and self.work.is_completed()
+
+    def wait(self):
+        return self.work.wait()
+
+
+def run(synchronous: bool, device, wait_s=None, delays=None):
+    """Replicated gradient per step. With `delays`, the gathers posted at step s
+    only report completion from step s + delays[s] on."""
     repl = DeMoBucketReplicator(compression_decay=DECAY, compression_topk=TOPK,
                                 compression_chunk=CHUNK, synchronous=synchronous)
     repl.init(dist.group.WORLD, {0: NUMEL}, torch.float32, device, lambda: LR)
+    original_all_gather = dist.all_gather
+    clock = {"s": 0}
+
+    def delayed_all_gather(*args, **kwargs):
+        work = original_all_gather(*args, **kwargs)
+        if kwargs.get("async_op") and delays is not None:
+            return DelayedWork(work, clock["s"] + delays[clock["s"]], clock)
+        return work
+
     stream = torch.cuda.Stream()
     outputs = []
-    for step in range(NUM_STEPS):
-        grad = make_grad(step, device)
-        stream.wait_stream(torch.cuda.current_stream())
-        event = repl.replicate_bucket_group([0], lambda _: grad, stream)
-        event.synchronize()
-        if wait_s > 0:
-            repl.finalize_step([0], lambda _: grad, wait_s)
-        torch.cuda.synchronize()
-        outputs.append(grad.clone())
+    dist.all_gather = delayed_all_gather
+    try:
+        for step in range(NUM_STEPS):
+            clock["s"] = step
+            grad = make_grad(step, device)
+            stream.wait_stream(torch.cuda.current_stream())
+            event = repl.replicate_bucket_group([0], lambda _: grad, stream)
+            event.synchronize()
+            if wait_s is not None:
+                # Let delay-0 collectives finish, as a network that keeps up with
+                # the backward pass would.
+                torch.cuda.synchronize()
+                repl.finalize_step([0], lambda _: grad, wait_s)
+            torch.cuda.synchronize()
+            outputs.append(grad.clone())
+    finally:
+        dist.all_gather = original_all_gather
     return outputs
 
 
@@ -101,6 +135,17 @@ def main():
     # async demo matches the synchronous result.
     check("adaptive demo applies step s in step s", run(False, device, wait_s=2.0),
           updates, rank)
+    # Late gathers are added at the next step, on top of that step's own
+    # update if it is in time; every update is applied exactly once.
+    delays = [0, 1, 0, 1, 1, 0]
+    expected = [torch.zeros(NUMEL, device=device) for _ in range(NUM_STEPS)]
+    for step, delay in enumerate(delays):
+        if step + delay < NUM_STEPS:
+            expected[step + delay] += updates[step]
+    check("adaptive demo with late gathers", run(False, device, wait_s=0.3, delays=delays),
+          expected, rank)
+    check("adaptive demo, no wait, with late gathers",
+          run(False, device, wait_s=0.0, delays=delays), expected, rank)
 
     dist.barrier()
     dist.destroy_process_group()

@@ -1378,8 +1378,8 @@ class MegatronFSDP(torch.nn.Module):
         # Synchronize gradient reduce-scatter operations for all model gradients.
         self.synchronize_gradient_reduce()
 
-        # DeToNation: give in-flight replication results a bounded chance to be
-        # applied in this step, and apply the optional sign step.
+        # DeToNation: apply the replication results that have arrived in this
+        # step (adaptive synchronization), and the optional sign step.
         if self.replicator is not None:
             self.grad_reduce_pipeline.finalize_replication()
 

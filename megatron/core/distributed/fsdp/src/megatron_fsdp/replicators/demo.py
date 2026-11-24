@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import time
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -77,9 +77,7 @@ class DeMoBucketReplicator(BucketReplicator):
         self._pending: Dict[
             int, Tuple[dist.Work, dist.Work, list, list, torch.Tensor, int]
         ] = {}
-        # Buckets whose result was already applied in the step it was sent
-        # (by finalize_step), so the next replicate call must not zero-fill.
-        self._fresh: Set[int] = set()
+        self._stats = {"fresh": 0, "late": 0, "dropped": 0}
 
     def pre_step(self) -> None:
         pass
@@ -93,10 +91,15 @@ class DeMoBucketReplicator(BucketReplicator):
         self._decode_pending(bucket_id)
         return True
 
+    def pop_stats(self) -> Dict[str, int]:
+        stats, self._stats = self._stats, {"fresh": 0, "late": 0, "dropped": 0}
+        return stats
+
     def _decode_pending(self, bucket_id: int, target: Optional[torch.Tensor] = None) -> None:
-        """Decode a completed gather into `target` (defaults to the gradient
-        buffer that was current when the gather was posted; pass the current
-        buffer explicitly, as bucket storage may have been reallocated since)."""
+        """Decode a completed gather and add it to `target` (defaults to the
+        gradient buffer that was current when the gather was posted; pass the
+        current buffer explicitly, as bucket storage may have been reallocated
+        since)."""
         idx_handle, val_handle, idx_bufs, val_bufs, result_buf, numel = self._pending.pop(
             bucket_id
         )
@@ -108,7 +111,7 @@ class DeMoBucketReplicator(BucketReplicator):
         )
         if target is None:
             target = result_buf
-        target.copy_(self._transform.decode(bucket_id, averaged))
+        target.add_(self._transform.decode(bucket_id, averaged))
 
     def finalize_step(
         self,
@@ -116,12 +119,16 @@ class DeMoBucketReplicator(BucketReplicator):
         get_buffer_fn: Callable[[int], torch.Tensor],
         deadline_s: float,
     ) -> None:
-        """Decode this step's gathers if they complete in time, making the
-        replicator synchronous whenever the network keeps up. A bucket that
-        misses the deadline keeps the local gradient for this step and its
-        result is decoded at the next step as usual."""
+        """Decode this step's gathers and add them to the gradient if they
+        complete in time, making the replicator synchronous whenever the
+        network keeps up. A result that misses the deadline is added at the
+        next step instead, so every transmitted update is applied once."""
         if self.synchronous or self._world_size <= 1:
             return
+        # Cutoff: when the step's gradients exist on the GPU, which the CPU
+        # usually reaches early. The replication collectives run on their own
+        # streams, so this does not wait for them.
+        torch.cuda.current_stream().synchronize()
         end = time.monotonic() + deadline_s
         remaining = [b for b in bucket_ids if b in self._pending]
         while remaining:
@@ -130,7 +137,7 @@ class DeMoBucketReplicator(BucketReplicator):
                 idx_handle, val_handle = self._pending[bucket_id][:2]
                 if idx_handle.is_completed() and val_handle.is_completed():
                     self._decode_pending(bucket_id, get_buffer_fn(bucket_id))
-                    self._fresh.add(bucket_id)
+                    self._stats["fresh"] += 1
                 else:
                     still_pending.append(bucket_id)
             remaining = still_pending
@@ -167,12 +174,14 @@ class DeMoBucketReplicator(BucketReplicator):
                     bucket_id, grad, lr, self.compression_decay
                 )
 
-                # Resolve previous step's result. The stored result buffer is
-                # this bucket's persistent gradient buffer, so the decoded
-                # result lands in `grad`.
-                had_pending = bucket_id in self._pending
-                if had_pending:
-                    self._decode_pending(bucket_id, grad)
+                if not self.synchronous:
+                    # The gradient buffer becomes the sum of the results that
+                    # arrive: a late one from the previous step now, and this
+                    # step's own if finalize_step sees it complete in time.
+                    grad.zero_()
+                    if bucket_id in self._pending:
+                        self._decode_pending(bucket_id, grad)
+                        self._stats["late"] += 1
 
                 # DCT encode the delta
                 encoded = self._transform.encode(bucket_id, delta)
@@ -220,25 +229,14 @@ class DeMoBucketReplicator(BucketReplicator):
                     group=self._process_group, async_op=True,
                 )
 
-                # Store result buffer for the NEXT step's wait_pending
-                # For the first step (no pending result), we'll zero-fill
+                # Resolved by finalize_step if it completes within this step,
+                # otherwise at the next step.
                 self._pending[bucket_id] = (
                     idx_handle, val_handle,
                     idx_gather_buf, val_gather_buf,
                     grad,  # reuse grad buffer for result
                     numel,
                 )
-
-                if not had_pending:
-                    if bucket_id in self._fresh:
-                        # Last step's result was applied in that same step, so
-                        # nothing is pending. Keep the local gradient as the
-                        # estimate; finalize_step replaces it with the decoded
-                        # result if the gathers complete in time.
-                        self._fresh.discard(bucket_id)
-                    else:
-                        # First step: no result available, zero-fill
-                        grad.zero_()
 
             event = stream.record_event()
 

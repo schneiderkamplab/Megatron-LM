@@ -100,7 +100,7 @@ def simulate(world_size, num_steps, delays, max_delay, device, seed=42, adaptive
     return expected
 
 
-def run(delays, max_delay, rank, world_size, device, step_offset=0, wait_s=0.0):
+def run(delays, max_delay, rank, world_size, device, step_offset=0, wait_s=None):
     num_steps = len(delays)
     repl = RandomBucketReplicator(compression_decay=DECAY, compression_rate=RATE,
                                   max_delay=max_delay)
@@ -123,7 +123,10 @@ def run(delays, max_delay, rank, world_size, device, step_offset=0, wait_s=0.0):
             grad = make_grad(rank, step, device)
             stream.wait_stream(torch.cuda.current_stream())
             repl.replicate_bucket_group([0], lambda _: grad, stream).synchronize()
-            if wait_s > 0:
+            if wait_s is not None:
+                # Let delay-0 collectives finish, as a network that keeps up with
+                # the backward pass would.
+                torch.cuda.synchronize()
                 repl.finalize_step([0], lambda _: grad, wait_s)
             torch.cuda.synchronize()
             outputs.append(grad.clone())
@@ -185,6 +188,8 @@ def main():
         expected = simulate(world_size, n, delays, 4, device, adaptive=True)
         outputs = run(delays, 4, rank, world_size, device, wait_s=0.3)
         check(name, outputs, expected, rank)
+        outputs = run(delays, 4, rank, world_size, device, wait_s=0.0)
+        check(name + " (no wait)", outputs, expected, rank)
 
     # Undersampling forces the zero-padding path.
     original_sigmas = random_module._OVERSAMPLE_SIGMAS

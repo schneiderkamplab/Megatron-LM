@@ -108,21 +108,31 @@ class BucketReplicator(ABC):
         """Called at the beginning of each training step, before gradient reduction."""
         pass
 
+    def pop_stats(self) -> Dict[str, int]:
+        """Counts of replication results applied since the last call: "fresh"
+        (in the step they were sent), "late" (in a later step) and "dropped".
+        Empty for replicators that apply every result immediately."""
+        return {}
+
     def finalize_step(
         self,
         bucket_ids: List[int],
         get_buffer_fn: Callable[[int], torch.Tensor],
         deadline_s: float,
     ) -> None:
-        """Give in-flight replication results a bounded chance to land in the
-        current step's gradients.
+        """Apply the replication results of this step that have arrived by the
+        time the optimizer needs the gradients.
 
         Called once per step after all bucket groups have replicated and right
-        before the optimizer runs. An asynchronous replicator should poll its
-        pending collectives for up to ``deadline_s`` seconds and apply every
-        result that has completed; anything still in flight is left for the
-        usual delayed-application path. Default is a no-op, which is correct
-        for synchronous and stateless replicators.
+        before the optimizer runs, with the current stream ordered after the
+        step's gradient computation. An asynchronous replicator should wait for
+        the current stream (the CPU usually runs ahead of the GPU, and the
+        cutoff is when the gradients exist, not when the CPU gets here), then
+        apply every result that has completed, polling for up to
+        ``deadline_s`` more seconds for the rest (0: check once, no waiting).
+        Anything still in flight is left for the delayed-application path.
+        Default is a no-op, which is correct for synchronous and stateless
+        replicators.
         """
         pass
 

@@ -108,7 +108,7 @@ def fully_shard_model(
     replication_rate: float = 0.1,
     replication_seed: int = 42,
     replication_max_delay: int = 4,
-    replication_wait_ms: float = 0.0,
+    replication_wait_ms: Optional[float] = 0.0,
     replication_sign: bool = False,
 ) -> torch.nn.Module:
     """
